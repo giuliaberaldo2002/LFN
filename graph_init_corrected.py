@@ -9,7 +9,7 @@ import sys
 import psutil
 import os
 
-FP = "bremen-251019.osm.pbf" 
+FP =  "data/bremen-251019.osm.pbf"  # "bremen-251019.osm.pbf" 
 OUTPUT_PKL = "bremen_processed_graph.pkl"
 NETWORK_TYPE = "driving"
 
