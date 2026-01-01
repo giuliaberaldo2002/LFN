@@ -1,6 +1,6 @@
 """
 ------------------
-Manual (guided) urbanity tuning via constrained random search.
+Manual urbanity tuning via constrained random search.
 
 Assumes the graph already has (node) attributes computed:
   - degree

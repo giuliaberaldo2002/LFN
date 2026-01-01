@@ -5,6 +5,7 @@ Computes features for an OSM road network, applies a manually tuned urbanity sco
 (learned by constrained random search in urbanity_tuning.py), and prunes rural nodes
 by fitting a 2-component GMM on the 1D score distribution.
 
+Author: Giulia 
 """
 
 import math
@@ -249,4 +250,32 @@ def main():
     logger.info(f"Feature order: {tuned_names}")
 
     # 3) build X and standardize
-    X = bu
+    X = build_X_from_names(g, tuned_names, cap_p=cap_p)
+    Z = StandardScaler().fit_transform(X).astype(np.float32, copy=False)
+
+    # 4) score
+    scores = (Z @ w).astype(np.float32, copy=False)
+    g.vs["urbanity_score"] = scores.tolist()
+
+    # 5) prune using GMM split on 1D scores
+    keep_indices = gmm_keep_indices(scores, seed=0, prob_threshold=0.5)
+
+    g_pruned = g.subgraph(keep_indices.tolist())
+    new_osmid_map = {new_i: osmid_map[old_i] for new_i, old_i in enumerate(keep_indices) if old_i in osmid_map}
+
+    logger.info(f"Original: {g.vcount():,}, Pruned: {g_pruned.vcount():,}")
+    logger.info(f"Nodes removed: {g.vcount() - g_pruned.vcount():,}")
+
+    package = {
+        "graph": g_pruned,
+        "osmid_map": new_osmid_map,
+        "crs": "epsg:4326",
+    }
+    with open(OUTPUT_PRUNED_PKL, "wb") as f:
+        pickle.dump(package, f)
+
+    logger.info(f"Saved pruned graph to {os.path.abspath(OUTPUT_PRUNED_PKL)}")
+
+
+if __name__ == "__main__":
+    main()
