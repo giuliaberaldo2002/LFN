@@ -19,7 +19,7 @@ It then:
 
 Usage:
   python urbanity_tuning.py \
-      --input bremen_processed_graph.pkl \
+      --input bremen_graph_with_features.pkl \
       --output urbanity_weights.json \
       --trials 800 --sample 80000 --seed 0
 """

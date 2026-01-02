@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # --- CONFIGURAZIONE SLURM ---
-#SBATCH --job-name=gen_grafo
-#SBATCH --output=output_%j.txt    # File di log standard
-#SBATCH --error=errors_%j.txt     # File di log errori
-#SBATCH --mem=32G                 # 32GB per il Nord-Est (64G se farai Germania)
-#SBATCH --time=00:30:00           # 30 minuti
+#SBATCH --job-name=urban_tuning    # 1. Nome aggiornato
+#SBATCH --output=output_urb_%j.txt # Log standard distinto
+#SBATCH --error=errors_urb_%j.txt  # Log errori distinto
+#SBATCH --mem=120G                  # 120GB 
+#SBATCH --time=01:00:00            # 2. Aumentato a 1h per sicurezza (il tuning fa molte prove)
 #SBATCH --partition=allgroups
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -14,12 +14,16 @@
 
 # --- ISTRUZIONI ---
 
-# 1. Vai nella tua cartella LFN
-# Nota: Usiamo $HOME che il cluster espande automaticamente nel tuo percorso utente
+# Vai nella tua cartella
 cd $HOME/LFN
 
-# 2. Attiva l'ambiente virtuale che hai appena creato nello Step 1
+# Attiva l'ambiente
 source $HOME/miniconda/bin/activate geo_env
 
-# 3. Esegui lo script Python per generare il grafo
-python3 graph_init.py
+# 3. COMANDO AGGIORNATO
+# Il nuovo script richiede "--input" (il grafo salvato prima) e "--output" (dove salvare i pesi)
+python3 urbanity_tuning.py \
+    --input bremen_pruned_with_communities.pkl \
+    --output urbanity_weights.json \
+    --trials 800 \
+    --sample 80000
