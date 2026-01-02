@@ -9,10 +9,10 @@ Distance definition:
   (weighted if edge weights are available, else hop distance). :contentReference[oaicite:1]{index=1}
 
 Metrics (MidTerm):
-- Community coverage: |{ i : Ci ∩ S ≠ ∅ }| / k, plus distribution of |Ci ∩ S| :contentReference[oaicite:2]{index=2}
-- Global coverage (k-center style): d(x,S)=min_{y∈S} d(x,y); report R=max_x d(x,S), mean/median/p90 :contentReference[oaicite:3]{index=3}
-- Diversity among sampled points: pairwise distances d(si,sj), min separation + stats :contentReference[oaicite:4]{index=4}
-- Balance across communities: CV = σ(ni)/µ(ni) or entropy-based score :contentReference[oaicite:5]{index=5}
+- Community coverage: |{ i : Ci \cap S notin \empty }| / k, plus distribution of |Ci \cap S| 
+- Global coverage (k-center style): d(x,S)=min_{y\inS} d(x,y); report R=max_x d(x,S), mean/median/p90 
+- Diversity among sampled points: pairwise distances d(si,sj), min separation + stats
+- Balance across communities: CV = sigma(ni)/mu(ni) or entropy-based score 
 
 Optimizations:
 - Multi-source Dijkstra (single run) to compute d(x,S) for all x and also nearest-center assignment.
@@ -245,8 +245,8 @@ def multisource_dijkstra(
 def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int]) -> Dict[str, Any]:
     """
     coverage = (#communities represented in S) / (#communities total)
-    and counts distribution |Ci ∩ S|.
-    :contentReference[oaicite:6]{index=6}
+    and counts distribution |Ci \cap S|.
+    
     """
     labels_full = np.asarray(labels_full)
     comms_full = np.unique(labels_full)
@@ -276,7 +276,7 @@ def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int])
 def metric_balance(counts_per_community: Dict[Any, int]) -> Dict[str, float]:
     """
     Balance across communities: CV and entropy_norm.
-    :contentReference[oaicite:7]{index=7}
+   
     """
     if not counts_per_community:
         return {"cv": float("nan"), "entropy_norm": float("nan")}
@@ -320,7 +320,7 @@ def metric_diversity_pairwise(
 ) -> Dict[str, float]:
     """
     Diversity among sampled points: pairwise shortest-path distances and min separation.
-    :contentReference[oaicite:9]{index=9}
+   
     """
     k = len(sampled_nodes)
     if k < 2:
