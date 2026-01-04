@@ -4,7 +4,7 @@
 #SBATCH --job-name=urbanity_pipeline
 #SBATCH --output=output_pipeline_%j.txt    # File di log standard
 #SBATCH --error=errors_pipeline_%j.txt     # File di log errori
-#SBATCH --mem=120G                         # Aumentato a 120G per Nord-Est
+#SBATCH --mem=64G                          # Aumentato a 64G per Nord-Est
 #SBATCH --time=01:00:00                    # 1 ora (stima prudente)
 #SBATCH --partition=allgroups
 #SBATCH --ntasks=1
@@ -14,8 +14,8 @@
 
 # --- ISTRUZIONI ---
 
-# 1. Vai nella tua cartella LFN/src (dove sono gli script)
-cd $HOME/LFN/src
+# 1. Vai nella tua cartella LFN
+cd $HOME/LFN2
 
 # 2. Attiva l'ambiente virtuale
 source $HOME/miniconda/bin/activate geo_env

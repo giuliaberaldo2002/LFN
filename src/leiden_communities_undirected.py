@@ -27,12 +27,22 @@ def main():
     print(f"Loaded pruned graph. Nodes: {Gp.vcount():,}, Edges: {Gp.ecount():,}")
 
     # ----------------- CHOOSE WEIGHTS (ONE VARIABLE) -----------------
+    # Create a working copy for Leiden (must be undirected)
+    if Gp.is_directed():
+        print("Graph is directed. Creating undirected copy for Leiden execution...")
+        Gp_run = Gp.copy()
+        # Collapse edges and average lengths. 
+        # combining 'length' is critical for the weights.
+        Gp_run.to_undirected(mode="collapse", combine_edges={"length": "mean", "weight": "mean"})
+    else:
+        Gp_run = Gp
+
     weights = None
-    edge_attr_names = Gp.es.attribute_names()
+    edge_attr_names = Gp_run.es.attribute_names()
 
     if "length" in edge_attr_names:
         # Option B: use 1 / length as strength (shorter roads = stronger connection)
-        lengths = np.array(Gp.es["length"], dtype=float)
+        lengths = np.array(Gp_run.es["length"], dtype=float)
         strengths = 1.0 / (lengths + 1e-6)
         weights = strengths.tolist()
         print("Using custom weights: 1 / length")
@@ -78,7 +88,7 @@ def main():
     GAMMAS = [0.001, 0.003, 0.005, 0.01, 0.02, 0.05]
     print("\nRunning Leiden (community_leiden) with CPM for different gamma values...")
     results = run_leiden_cpm_tuning(
-        Gp,
+        Gp_run,
         gammas=GAMMAS,
         weights=weights,
         n_iterations=10,
@@ -99,7 +109,9 @@ def main():
 
     # ----------------- USE BEST PARTITION -----------------
     part = best_part
-
+    
+    # Assign membership back to the ORIGINAL (potentially directed) graph
+    # Node indices are preserved during to_undirected(mode='collapse')
     Gp.vs["community"] = part.membership
     num_comms = len(part)
     print(f"\nLeiden finished. Found {num_comms} communities with gamma = {best_gamma}.")

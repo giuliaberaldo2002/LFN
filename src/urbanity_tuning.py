@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import pickle
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ from sklearn.preprocessing import StandardScaler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("urbanity_tuning")
 
