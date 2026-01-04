@@ -13,6 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Leiden Community Detection on Pruned Graph")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pruned graph pickle")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output graph with community labels pickle")
+    parser.add_argument("--objective", default="CPM", choices=["CPM", "modularity"], help="Leiden objective function")
     args = parser.parse_args()
 
     # ----------------- LOAD GRAPH -----------------
@@ -64,14 +65,14 @@ def main():
             "size_max": int(sizes.max()),
         }
 
-    def run_leiden_cpm_tuning(g, gammas, weights=None, n_iterations=10):
+    def run_leiden_tuning(g, gammas, objective="CPM", weights=None, n_iterations=10):
         results = []
         for gamma in gammas:
             print(f"\n=== Gamma = {gamma} ===")
             part = g.community_leiden(
-                objective_function="CPM",
+                objective_function=objective,
                 weights=weights,
-                resolution_parameter=gamma,
+                resolution=gamma,
                 n_iterations=n_iterations,
             )
             stats = summarize_partition(part)
@@ -85,11 +86,17 @@ def main():
         return results
 
     # ----------------- GAMMA SWEEP -----------------
-    GAMMAS = [0.001, 0.003, 0.005, 0.01, 0.02, 0.05]
-    print("\nRunning Leiden (community_leiden) with CPM for different gamma values...")
-    results = run_leiden_cpm_tuning(
+    if args.objective == "CPM":
+        GAMMAS = [0.001, 0.003, 0.005, 0.01, 0.02, 0.05]
+    else:
+        # For Modularity, resolution around 1.0 is standard. Lower -> larger communities.
+        GAMMAS = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0]
+
+    print(f"\nRunning Leiden (community_leiden) with {args.objective} for different gamma values...")
+    results = run_leiden_tuning(
         Gp_run,
         gammas=GAMMAS,
+        objective=args.objective,
         weights=weights,
         n_iterations=10,
     )
