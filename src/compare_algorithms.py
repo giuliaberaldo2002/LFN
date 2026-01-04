@@ -7,6 +7,8 @@ import json
 import logging
 import igraph as ig
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 from collections import Counter
