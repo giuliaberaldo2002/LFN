@@ -1,3 +1,33 @@
+"""
+leiden_communities_undirected.py
+
+Run Leiden community detection on a (possibly directed) pruned road graph and
+save the graph with a vertex-level "community" label.
+
+Input:
+- A pickle containing either:
+  - an igraph.Graph, or
+  - a dict with key "graph" -> igraph.Graph.
+
+Processing:
+- If the graph is directed, create an undirected working copy for Leiden via
+  edge collapse (combining attributes like length/weight by mean).
+- Choose edge weights if available ("length" preferred, otherwise "weight";
+  otherwise unweighted Leiden).
+- Run a small resolution (gamma) sweep depending on objective:
+  - CPM: small resolution values
+  - modularity: values around 1.0
+- Select the partition with the best reported quality (q) and write
+  membership to the ORIGINAL graph as:  Gp.vs["community"] = membership
+
+Output:
+- A pickle saved to --output. If the input was a dict package, the same dict
+  is copied and its "graph" entry is replaced with the updated graph.
+
+CLI:
+  --input, --output, --objective {CPM, modularity}
+"""
+
 import argparse
 import igraph as ig
 import pickle
@@ -5,10 +35,13 @@ import numpy as np
 import sys
 import os
 
-# ----------------- ARGS -----------------
+# arguments
 DEFAULT_INPUT = "nord_est_pruned_graph.pkl"
 DEFAULT_OUTPUT = "nord_est_pruned_with_communities.pkl"
 
+"""
+    Parse CLI args, run Leiden (optionally weighted), attach ``community`` labels, and save the result.
+"""
 def main():
     parser = argparse.ArgumentParser(description="Run Leiden Community Detection on Pruned Graph")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pruned graph pickle")
@@ -16,7 +49,7 @@ def main():
     parser.add_argument("--objective", default="CPM", choices=["CPM", "modularity"], help="Leiden objective function")
     args = parser.parse_args()
 
-    # ----------------- LOAD GRAPH -----------------
+    # --- Load graph ---
     if not os.path.exists(args.input):
         print(f"ERROR: {args.input} not found.")
         sys.exit(1)

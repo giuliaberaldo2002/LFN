@@ -2,6 +2,7 @@ import argparse
 import pickle
 import igraph as ig
 import matplotlib
+
 # Force Agg backend for headless environments (clusters)
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -14,6 +15,9 @@ DEFAULT_OUTPUT = "nord_est_clusters.png"
 TOP_N_COMMUNITIES = 20  # Number of largest communities to color distinctly
 
 def main():
+    """
+    Parse CLI args, load the graph, and save a PNG scatter plot highlighting the largest communities.
+    """
     parser = argparse.ArgumentParser(description="Visualize Leiden Communities on Map")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pickled graph file")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output PNG file path")
@@ -115,7 +119,7 @@ def main():
 
     # Optional: Legend for top 5 to check colors? 
     # Usually for 700k nodes a legend is messy, but title is enough.
-
+    
     plt.tight_layout()
     plt.savefig(args.output, dpi=args.dpi, format='png', bbox_inches='tight', facecolor='black')
     print(f"Saved visualization to {args.output}")

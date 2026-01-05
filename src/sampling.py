@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-sampling_midterm_optimized.py
 ----------------------------
-Sampling + evaluation aligned with MidTerm report metrics.
+Sampling + evaluation according to the metrics defined below.
 
 Distance definition:
 - use shortest-path distance on the road graph as underlying d(·,·)
-  (weighted if edge weights are available, else hop distance). :contentReference[oaicite:1]{index=1}
+  (weighted if edge weights are available, else hop distance).
 
-Metrics (MidTerm):
+Metrics:
 - Community coverage: |{ i : Ci \cap S notin \empty }| / k, plus distribution of |Ci \cap S| 
 - Global coverage (k-center style): d(x,S)=min_{y\inS} d(x,y); report R=max_x d(x,S), mean/median/p90 
 - Diversity among sampled points: pairwise distances d(si,sj), min separation + stats
@@ -18,7 +17,6 @@ Optimizations:
 - Multi-source Dijkstra (single run) to compute d(x,S) for all x and also nearest-center assignment.
 - Optional evaluation on a subset of nodes to reduce runtime for huge graphs.
 
-Author: Giulia
 """
 
 import os
@@ -41,16 +39,23 @@ except ImportError:
     _HAS_SKLEARN = False
 
 
-# ============================================================
-# Sampling methods
-# ============================================================
 
+# Sampling methods
 def sample_round_robin(g: ig.Graph, k: int, seed: int | None = None) -> list[int]:
     """
-    Community-based round-robin sampling WITHOUT duplicates.
-    - Requires vertex attribute 'community'.
-    - Round-robin over communities: take 1 node per community per pass (without replacement)
-      until k samples (or all nodes exhausted).
+    Round-robin sampling across communities (no duplicates).
+    
+    Args:
+        g: igraph graph with vertex attribute ``community``.
+        k: Number of vertices to sample.
+        seed: RNG seed for reproducibility.
+    
+    Returns:
+        List of sampled vertex indices (length <= k).
+    
+    Notes:
+        The sampler cycles through communities, taking one vertex per community per pass
+        (without replacement) until ``k`` samples are collected or all vertices are exhausted.
     """
     if k <= 0 or g.vcount() == 0:
         return []
@@ -95,15 +100,23 @@ def fft_sample_graph(
     g: ig.Graph,
     k: int,
     weight_attr: str | None = "length",
-    seed_idx: int | None = None,
-) -> list[int]:
+    seed_idx: int | None = None,) -> list[int]:
     """
-    Farthest-First Traversal (FFT) on graph shortest-path distances.
-    Uses igraph shortest paths each iteration (can be expensive for large k).
-
-    - k: number of samples
-    - weight_attr: edge attribute used as distance (e.g. 'length'), or None for unweighted
-    - seed_idx: starting node; if None choose max-degree node
+    Farthest-First Traversal (Gonzalez k-center heuristic) on graph distances.
+    
+    Args:
+        g: igraph graph.
+        k: Number of vertices to sample.
+        weight_attr: Edge attribute used as distance (e.g. ``length``). If missing/None, uses unweighted hops.
+        seed_idx: Optional starting vertex. If None, starts from the max-degree vertex.
+        seed: RNG seed used only when choosing a random start (if implemented).
+    
+    Returns:
+        List of sampled vertex indices.
+    
+    Notes:
+        This implementation recomputes shortest-path distances from each newly added center,
+        so it can be expensive for large ``k`` or large graphs.
     """
     n = g.vcount()
     if n == 0 or k <= 0:
@@ -140,11 +153,23 @@ def fft_sample_graph(
     return centers
 
 
-# ============================================================
+
 # Graph distance backend (CSR + multi-source Dijkstra)
-# ============================================================
+
 
 def _replace_infinite(x: np.ndarray) -> np.ndarray:
+    """
+    Replace ``inf`` entries in a distance array with a finite sentinel.
+    
+    This is useful when shortest-path queries return ``inf`` for disconnected graphs.
+    The sentinel is chosen as ``max_finite + 1`` (or 0 if all entries are infinite).
+    
+    Args:
+        dist: Numpy array of distances.
+    
+    Returns:
+        A float array with all infinite values replaced.
+    """
     x = np.array(x, dtype=float)
     inf = ~np.isfinite(x)
     if inf.any():
@@ -156,12 +181,17 @@ def _replace_infinite(x: np.ndarray) -> np.ndarray:
 
 def build_csr_adjacency(g: ig.Graph, weight_attr: str | None = "length") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build CSR adjacency for fast multi-source Dijkstra.
-
+    Build a CSR adjacency representation for fast Dijkstra.
+    
+    Args:
+        g: igraph graph (treated as undirected; both directions are stored).
+        weight_attr: Edge attribute to use as weight. If missing/None, uses weight 1.0.
+    
     Returns:
-      indptr: (n+1,)
-      indices: (2m,) neighbors
-      data: (2m,) weights (or 1.0 if unweighted)
+        (indptr, indices, data) in CSR format, where each edge is stored in both directions.
+    
+    Notes:
+        The output is suitable for ``multisource_dijkstra`` below.
     """
     n = g.vcount()
     m = g.ecount()
@@ -201,12 +231,19 @@ def multisource_dijkstra(
     sources: List[int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Multi-source Dijkstra:
-    Computes dist[x] = min_{s in sources} d(s,x) and owner[x] = argmin source (one of the nearest).
-
+    Compute nearest-center distances with a single multi-source Dijkstra.
+    
+    Given a set of source vertices S, computes:
+        dist[x]  = min_{s in S} d(s, x)
+        owner[x] = argmin source s (index into the provided ``sources`` list)
+    
+    Args:
+        indptr, indices, data: CSR adjacency as built by ``build_csr_adjacency``.
+        sources: Iterable of source vertex indices.
+    
     Returns:
-      dist: (n,) float
-      owner: (n,) int (source id), -1 if unreachable
+        dist: 1D float array of length n (inf if unreachable).
+        owner: 1D int array of length n with values in [0, len(sources)-1], or -1 if unreachable.
     """
     n = len(indptr) - 1
     dist = np.full(n, np.inf, dtype=np.float64)
@@ -244,9 +281,18 @@ def multisource_dijkstra(
 
 def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int]) -> Dict[str, Any]:
     """
-    coverage = (#communities represented in S) / (#communities total)
-    and counts distribution |Ci \cap S|.
+    Compute community coverage metrics for a sample.
     
+    Args:
+        communities: 1D array of community id per vertex.
+        sampled_nodes: List/array of sampled vertex indices.
+    
+    Returns:
+        Dict with:
+          - coverage_frac: fraction of unique communities that are hit by the sample.
+          - covered_communities: number of covered communities.
+          - total_communities: total number of communities.
+          - per_comm_counts: dict community_id -> number of sampled vertices in that community.
     """
     labels_full = np.asarray(labels_full)
     comms_full = np.unique(labels_full)
@@ -275,9 +321,18 @@ def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int])
 
 def metric_balance(counts_per_community: Dict[Any, int]) -> Dict[str, float]:
     """
-    Balance across communities: CV and entropy_norm.
-   
+    Compute balance of the sample across communities.
+    
+    Args:
+        per_comm_counts: dict community_id -> count sampled in that community.
+    
+    Returns:
+        Dict with:
+          - cv: coefficient of variation of counts (std/mean).
+          - entropy: Shannon entropy of the normalized counts.
+          - entropy_norm: entropy normalized to [0,1] by dividing by log(#covered).
     """
+    
     if not counts_per_community:
         return {"cv": float("nan"), "entropy_norm": float("nan")}
 
@@ -299,8 +354,15 @@ def metric_balance(counts_per_community: Dict[Any, int]) -> Dict[str, float]:
 
 def metric_global_coverage_from_dist(dist_to_S: np.ndarray) -> Dict[str, float]:
     """
-    Global coverage (k-center style): summarize d(x,S) with R=max, mean/median/p90.
-    :contentReference[oaicite:8]{index=8}
+    Summarize global coverage statistics from a distance-to-sample array.
+    
+    Args:
+        dist_to_sample: 1D array with d(x, S) for each evaluated vertex x.
+    
+    Returns:
+        Dict with:
+          - radius: max_x d(x,S)
+          - mean/median/p90: summary statistics of d(x,S)
     """
     d = np.asarray(dist_to_S, dtype=float)
     d = _replace_infinite(d)
@@ -319,8 +381,18 @@ def metric_diversity_pairwise(
     weight_attr: str | None = "length",
 ) -> Dict[str, float]:
     """
-    Diversity among sampled points: pairwise shortest-path distances and min separation.
-   
+    Compute diversity of the sample via pairwise shortest-path distances.
+    
+    Args:
+        g: igraph graph.
+        sampled_nodes: Sampled vertex indices.
+        weight_attr: Edge attribute used as distance (or None for unweighted).
+    
+    Returns:
+        Dict with min/mean/median/p10/p90 of pairwise distances among sampled vertices.
+    
+    Notes:
+        Requires k>=2. For k<2 returns NaNs.
     """
     k = len(sampled_nodes)
     if k < 2:
@@ -349,9 +421,21 @@ def metric_diversity_pairwise(
 
 def metric_clustering_agreement(labels_true: np.ndarray, nearest_center_assignment: np.ndarray) -> Dict[str, Optional[float]]:
     """
-    Optional (needs sklearn): compare community labels vs nearest-sample induced assignment via ARI/NMI.
-    Not required in MidTerm list, but useful sanity check.
+    Compare nearest-center assignment to ground-truth labels.
+    
+    Args:
+        labels_true: 1D array of ground-truth labels (e.g., community ids) per vertex.
+        nearest_center_assignment: 1D array with predicted cluster id per vertex (or -1 for unreachable).
+    
+    Returns:
+        Dict with:
+          - ari: Adjusted Rand Index
+          - nmi: Normalized Mutual Information
+    
+    Notes:
+        Vertices with assignment -1 are ignored.
     """
+    
     if not _HAS_SKLEARN:
         return {"ari": None, "nmi": None}
 
@@ -379,9 +463,22 @@ def evaluate_midterm(
     weight_attr: str | None = "length",
 ) -> Dict[str, Any]:
     """
-    Evaluate ONE sampled set S with MidTerm metrics using optimized multi-source Dijkstra.
-
-    eval_subset: optional array of node indices to approximate global coverage / assignment.
+    Evaluate one sampled set S using the MidTerm metrics.
+    
+    Args:
+        g: igraph graph.
+        sampled_nodes: Sampled vertex indices S.
+        weight_attr: Edge attribute used as distance.
+        eval_subset: Optional subset of vertices to approximate global metrics (speed-up).
+        csr_cache: Optional tuple (indptr, indices, data) to reuse CSR adjacency.
+    
+    Returns:
+        Dict aggregating:
+          - community coverage
+          - global coverage (k-center style) based on d(x,S)
+          - diversity among sampled points
+          - balance across communities
+          - clustering agreement (if communities available)
     """
     sampled_nodes = list(map(int, sampled_nodes))
 
@@ -418,6 +515,19 @@ def evaluate_midterm(
 # ============================================================
 
 def load_graph(pkl_path: str) -> ig.Graph:
+    """
+    Load an igraph graph from a pickle.
+    
+    The pickle can store either:
+    - an ``igraph.Graph`` directly, or
+    - a dict-like "package" with a ``'graph'`` key.
+    
+    Args:
+        path: Path to the pickle file.
+    
+    Returns:
+        (graph, package) where package is the loaded object (igraph.Graph or dict).
+    """
     with open(pkl_path, "rb") as f:
         pkg = pickle.load(f)
     return pkg["graph"]

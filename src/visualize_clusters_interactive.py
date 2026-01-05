@@ -1,3 +1,30 @@
+"""
+visualize_clusters_interactive.py
+
+Create an interactive Folium HTML map summarizing the largest communities
+in a graph.
+
+Input:
+- A pickle containing either:
+  - an igraph.Graph, or
+  - a dict with key "graph" -> igraph.Graph.
+- Vertex attributes:
+  - "community" (int community id per vertex)
+  - coordinates as either ("x","y") or ("lon","lat")
+    (interpreted as longitude=x/lon and latitude=y/lat).
+
+Output:
+- An HTML file with markers placed at the centroid of each of the top-K
+  largest communities (by vertex count). Each marker popup reports:
+  rank, community id, and size. A semi-transparent circle is optionally
+  added using the community coordinate spread as a rough radius.
+
+CLI:
+  --input   path to pickle
+  --output  path to HTML
+  --top_k   number of largest communities to show
+"""
+
 import argparse
 import pickle
 import igraph as ig
@@ -11,6 +38,9 @@ DEFAULT_OUTPUT = "nord_est_map.html"
 TOP_K = 50  # Check top 50 communities
 
 def main():
+    """
+    Parse CLI args, load the graph, compute top-K community centroids, and write an HTML map.
+    """
     parser = argparse.ArgumentParser(description="Create Interactive Map of Communities")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pickled graph file")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output HTML file path")
