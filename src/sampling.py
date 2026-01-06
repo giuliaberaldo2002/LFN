@@ -39,61 +39,95 @@ except ImportError:
     _HAS_SKLEARN = False
 
 
-
 # Sampling methods
-def sample_round_robin(g: ig.Graph, k: int, seed: int | None = None) -> list[int]:
+
+# Round Robin 
+def sample_round_robin_no_replacement(
+    g: ig.Graph,
+    k: int,
+    seed: int | None = None,
+    reshuffle_on_reset: bool = True,
+) -> list[int]:
     """
-    Round-robin sampling across communities (no duplicates).
-    
-    Args:
-        g: igraph graph with vertex attribute ``community``.
-        k: Number of vertices to sample.
-        seed: RNG seed for reproducibility.
-    
-    Returns:
-        List of sampled vertex indices (length <= k).
-    
-    Notes:
-        The sampler cycles through communities, taking one vertex per community per pass
-        (without replacement) until ``k`` samples are collected or all vertices are exhausted.
+    Community-based sampling (GeoGuessr-city style):
+    - Iterate over communities in round-robin order.
+    - From each community, draw a node WITHOUT replacement (until that community is exhausted).
+    - If all communities are exhausted before reaching k:
+        - reset (allow nodes again) and reshuffle (optional), then continue.
+    - Never returns duplicates *within the same cycle*; duplicates can only happen after a full reset.
+    - Requires vertex attribute 'community'.
+
+    This matches the policy:
+      "If k > #communities, revisit previously used communities but avoid reusing
+       nodes already sampled from that community, unless we've seen all nodes;
+       then restart with a reshuffle."
     """
     if k <= 0 or g.vcount() == 0:
         return []
     if "community" not in g.vs.attribute_names():
-        raise ValueError("Vertex attribute 'community' is required for round-robin sampling.")
+        raise ValueError("Vertex attribute 'community' is required.")
 
     rng = np.random.default_rng(seed)
+    comm = np.asarray(g.vs["community"], dtype=int)
 
-    comm_values = np.array(g.vs["community"], dtype=int)
-    groups: dict[int, list[int]] = defaultdict(list)
-    for idx, c in enumerate(comm_values):
-        groups[int(c)].append(int(idx))
+    # Build initial pools per community
+    pools: dict[int, list[int]] = defaultdict(list)
+    for v, c in enumerate(comm):
+        pools[int(c)].append(int(v))
 
-    community_ids = sorted(groups.keys())
+    community_ids = list(pools.keys())
     if not community_ids:
         return []
 
-    # Shuffle within each community so we can pop without replacement
-    for cid in community_ids:
-        rng.shuffle(groups[cid])
+    # Shuffle community order (important to avoid bias)
+    rng.shuffle(community_ids)
 
-    total_available = sum(len(groups[cid]) for cid in community_ids)
-    target = min(k, total_available)
+    # Shuffle each pool once; we will pop() to sample without replacement
+    for cid in community_ids:
+        rng.shuffle(pools[cid])
+
+    # Save originals for reset
+    original_pools = {cid: pools[cid].copy() for cid in community_ids}
+
+    total_nodes = sum(len(original_pools[cid]) for cid in community_ids)
+    if total_nodes == 0:
+        return []
 
     samples: list[int] = []
-    while len(samples) < target:
+    # We’ll keep taking until we have k (with resets as needed)
+    while len(samples) < k:
         progressed = False
+
         for cid in community_ids:
-            if len(samples) >= target:
+            if len(samples) >= k:
                 break
-            if groups[cid]:
-                samples.append(groups[cid].pop())
+            if pools[cid]:
+                samples.append(pools[cid].pop())
                 progressed = True
-        if not progressed:
+
+        if progressed:
+            continue
+
+        # If we didn't progress, all pools are empty -> reset
+        pools = {cid: original_pools[cid].copy() for cid in community_ids}
+        if reshuffle_on_reset:
+            rng.shuffle(community_ids)
+            for cid in community_ids:
+                rng.shuffle(pools[cid])
+            # also refresh the "original" order for next cycle
+            original_pools = {cid: pools[cid].copy() for cid in community_ids}
+        else:
+            # restore original_pools order without reshuffling
+            pass
+
+        # If even after reset we cannot progress (shouldn't happen unless graph empty)
+        if all(len(pools[cid]) == 0 for cid in community_ids):
             break
 
-    assert len(samples) == len(set(samples)), "BUG: duplicates in round-robin sampler"
+    # Note: duplicates are possible only if k > total_nodes (after reset),
+    # which is exactly what you described.
     return samples
+
 
 
 def fft_sample_graph(
