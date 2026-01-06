@@ -41,7 +41,7 @@ except ImportError:
 
 # Sampling methods
 
-# Round Robin 
+# 1 Round Robin 
 def sample_round_robin(
     g: ig.Graph,
     k: int,
@@ -129,7 +129,7 @@ def sample_round_robin(
     return samples
 
 
-
+# 2 fft 
 def fft_sample_graph(
     g: ig.Graph,
     k: int,
@@ -187,10 +187,182 @@ def fft_sample_graph(
     return centers
 
 
+def _groups_by_community(g: ig.Graph) -> dict[int, list[int]]:
+    if "community" not in g.vs.attribute_names():
+        raise ValueError("Vertex attribute 'community' is required.")
+    comm = np.asarray(g.vs["community"], dtype=int)
+    groups: dict[int, list[int]] = defaultdict(list)
+    for v, c in enumerate(comm):
+        groups[int(c)].append(int(v))
+    return groups
+
+
+def _choose_city_representatives_max_degree(
+    g: ig.Graph,
+    groups: dict[int, list[int]],
+) -> dict[int, int]:
+    """
+    Representative per city/community = max-degree node inside that community.
+    Cheap + surprisingly robust in urban graphs.
+    """
+    deg = np.asarray(g.degree(), dtype=int)
+    reps: dict[int, int] = {}
+    for cid, nodes in groups.items():
+        reps[cid] = int(nodes[int(np.argmax(deg[nodes]))])
+    return reps
+
+
+def _fft_city_order(
+    g: ig.Graph,
+    weight_attr: str | None = "length",
+    seed: int | None = None,
+    seed_city: int | None = None,
+) -> list[int]:
+    """
+    Returns an ordering of communities (cities) using FFT on city representatives.
+    Distance between cities i,j is shortest-path distance between their reps.
+    """
+    groups = _groups_by_community(g)
+    city_ids = list(groups.keys())
+    if not city_ids:
+        return []
+
+    reps = _choose_city_representatives_max_degree(g, groups)
+
+    # edge weights
+    if weight_attr is not None and weight_attr in g.es.attribute_names():
+        weights = list(map(float, g.es[weight_attr]))
+    else:
+        weights = None
+
+    # choose seed city if not given
+    if seed_city is None:
+        # pick city whose representative has highest degree
+        deg = np.asarray(g.degree(), dtype=int)
+        seed_city = max(city_ids, key=lambda cid: deg[reps[cid]])
+
+    # (optional) stable tie-breaking shuffle of city list
+    rng = np.random.default_rng(seed)
+    city_ids = list(city_ids)
+    rng.shuffle(city_ids)
+
+    # Ensure seed_city is first in the internal list for determinism
+    if seed_city in city_ids:
+        city_ids.remove(seed_city)
+    city_ids.insert(0, seed_city)
+
+    rep_list = [reps[cid] for cid in city_ids]
+
+    # distances from first rep to all reps
+    d0 = np.array(g.shortest_paths(source=reps[seed_city], target=rep_list, weights=weights)[0], dtype=float)
+    d0 = _replace_infinite(d0)
+    dist_to_centers = d0.copy()
+
+    order = [int(seed_city)]
+    chosen = set(order)
+
+    # Build full FFT order over cities
+    while len(order) < len(city_ids):
+        idx = int(np.argmax(dist_to_centers))
+        cid = int(city_ids[idx])
+        if cid in chosen:
+            dist_to_centers[idx] = -np.inf
+            continue
+
+        order.append(cid)
+        chosen.add(cid)
+
+        dn = np.array(g.shortest_paths(source=reps[cid], target=rep_list, weights=weights)[0], dtype=float)
+        dn = _replace_infinite(dn)
+        dist_to_centers = np.minimum(dist_to_centers, dn)
+        dist_to_centers[idx] = -np.inf  # avoid reselecting same city
+
+    return order
+
+# 3 hybrid
+def hybrid_city_ordered_round_robin(
+    g: ig.Graph,
+    k: int,
+    seed: int | None = None,
+    weight_attr: str | None = "length",
+    reshuffle_within_city_on_reset: bool = True,
+    reshuffle_city_order_on_reset: bool = True,
+) -> list[int]:
+    """
+    HYBRID sampler (GeoGuessr-style):
+      - Cities = Leiden communities.
+      - Step 1: compute a distance-aware ORDER of cities via FFT on city representatives.
+      - Step 2: sample nodes in round-robin following that city order.
+               Within each city, sample WITHOUT replacement until the city is exhausted.
+      - If all cities are exhausted before reaching k, RESET (allow reuse) and continue.
+        After reset you can reshuffle city order (optional) and always reshuffle within-city pools (optional).
+
+    Returns: list of vertex indices (length k, unless graph empty).
+    """
+    if k <= 0 or g.vcount() == 0:
+        return []
+    if "community" not in g.vs.attribute_names():
+        raise ValueError("Vertex attribute 'community' is required.")
+
+    rng = np.random.default_rng(seed)
+
+    # 1) Distance-aware city order (FFT on reps)
+    city_order = _fft_city_order(g, weight_attr=weight_attr, seed=seed, seed_city=None)
+    if not city_order:
+        return []
+
+    # 2) Build pools per city (shuffled), sample without replacement inside each city
+    groups = _groups_by_community(g)
+
+    def build_pools() -> dict[int, list[int]]:
+        pools = {cid: list(nodes) for cid, nodes in groups.items()}
+        if reshuffle_within_city_on_reset:
+            for cid in pools:
+                rng.shuffle(pools[cid])
+        return pools
+
+    pools = build_pools()
+    total_nodes = sum(len(v) for v in pools.values())
+    if total_nodes == 0:
+        return []
+
+    samples: list[int] = []
+    city_pos = 0  # pointer into city_order
+
+    while len(samples) < k:
+        progressed = False
+
+        # one “pass” over the city order
+        for _ in range(len(city_order)):
+            if len(samples) >= k:
+                break
+
+            cid = int(city_order[city_pos])
+            city_pos = (city_pos + 1) % len(city_order)
+
+            if pools[cid]:
+                samples.append(int(pools[cid].pop()))
+                progressed = True
+
+        if progressed:
+            continue
+
+        # No progress => all pools empty => RESET
+        pools = build_pools()
+
+        if reshuffle_city_order_on_reset:
+            rng.shuffle(city_order)
+            city_pos = 0
+
+        # (very degenerate) if still empty, break
+        if all(len(pools[cid]) == 0 for cid in city_order):
+            break
+
+    return samples
+
+
 
 # Graph distance backend (CSR + multi-source Dijkstra)
-
-
 def _replace_infinite(x: np.ndarray) -> np.ndarray:
     """
     Replace ``inf`` entries in a distance array with a finite sentinel.
@@ -310,7 +482,7 @@ def multisource_dijkstra(
 
 
 # ============================================================
-# Midterm metrics
+#  Metrics
 # ============================================================
 
 def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int]) -> Dict[str, Any]:

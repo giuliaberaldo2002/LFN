@@ -43,6 +43,7 @@ import matplotlib.pyplot as plt
 from sampling import (
     sample_round_robin,
     fft_sample_graph,
+    hybrid_city_ordered_round_robin,
     build_csr_adjacency,
     evaluate_midterm,
 )
@@ -118,6 +119,8 @@ def algo_pipeline_smart(pruned_g, k: int, seed: int, method: str, weight_attr: s
     elif method == "fft":
         # deterministic seed selection is inside fft_sample_graph unless you set seed_idx
         idx = fft_sample_graph(pruned_g, k, weight_attr=weight_attr, seed_idx=None)
+    elif method == "hybrid":
+        idx = hybrid_city_ordered_round_robin(pruned_g, k, seed=seed, weight_attr=weight_attr)
     else:
         raise ValueError(f"Unknown smart method: {method}")
 
