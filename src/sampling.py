@@ -42,7 +42,7 @@ except ImportError:
 # Sampling methods
 
 # Round Robin 
-def sample_round_robin_no_replacement(
+def sample_round_robin(
     g: ig.Graph,
     k: int,
     seed: int | None = None,
