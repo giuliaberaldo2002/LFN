@@ -40,7 +40,7 @@ from sampling import (
     sample_round_robin,
     fft_sample_graph,
     hybrid_city_ordered_round_robin,
-    build_csr_adjacency,
+    compute_fft_city_order_optimized,
     evaluate_midterm,
 )
 
@@ -97,11 +97,10 @@ def algo_pruned_random(pruned_g, k: int, seed: int) -> List[int]:
     osmids = get_osmid_array(pruned_g)
     return [int(osmids[i]) for i in idx]
 
-def algo_pipeline_smart(pruned_g, k: int, seed: int, method: str, weight_attr: str) -> List[int]:
+def algo_pipeline_smart(pruned_g, k: int, seed: int, method: str, weight_attr: str, cached_city_order: Optional[List[int]] = None) -> List[int]:
     """
     Smart sampling on PRUNED graph.
     method: 'round_robin' | 'fft' | 'hybrid'
-    Returns OSMIDs.
     """
     if k <= 0 or pruned_g.vcount() == 0:
         return []
@@ -113,7 +112,10 @@ def algo_pipeline_smart(pruned_g, k: int, seed: int, method: str, weight_attr: s
     elif method == "fft":
         idx = fft_sample_graph(pruned_g, k, weight_attr=weight_attr, seed_idx=None)
     elif method == "hybrid":
-        idx = hybrid_city_ordered_round_robin(pruned_g, k, seed=seed, weight_attr=weight_attr)
+        idx = hybrid_city_ordered_round_robin(
+            pruned_g, k, seed=seed, weight_attr=weight_attr,
+            cached_city_order=cached_city_order
+        )
     else:
         raise ValueError(f"Unknown smart method: {method}")
 
@@ -173,7 +175,6 @@ def evaluate_on_pruned(
     pruned_osmid_to_idx: Dict[int, int],
     sampled_osmids: List[int],
     labels_full: np.ndarray,
-    indptr, indices, data,
     weight_attr: str,
     eval_subset: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Any], int, float]:
@@ -204,7 +205,6 @@ def evaluate_on_pruned(
         pruned_g,
         labels_full,
         valid_idx,
-        indptr, indices, data,
         eval_subset=eval_subset,
         weight_attr=weight_attr,
     )
@@ -271,8 +271,8 @@ def main():
     logger.info(f"Full graph:   n={full_g.vcount():,}, m={full_g.ecount():,}")
     logger.info(f"Pruned graph: n={pruned_g.vcount():,}, m={pruned_g.ecount():,}")
 
-    # Precompute CSR once (major speedup)
-    indptr, indices, data = build_csr_adjacency(pruned_g, weight_attr=args.weight_attr)
+    # Precompute CSR once (major speedup) -> Replaced by igraph
+    # indptr, indices, data = build_csr_adjacency(pruned_g, weight_attr=args.weight_attr)
 
     # Optional eval subset
     eval_subset = None
@@ -288,13 +288,19 @@ def main():
     for r in range(args.repeats):
         run_seed = args.seed + r
         logger.info(f"=== Repeat {r+1}/{args.repeats} seed={run_seed} ===")
+        
+        # Precompute city order for 'hybrid' if needed
+        cached_order = None
+        if "hybrid" in smart_list:
+            logger.info("  Precomputing community FFT order (optimized)...")
+            cached_order = compute_fft_city_order_optimized(pruned_g, weight_attr=args.weight_attr, seed=run_seed)
 
         for k in args.ks:
-            # 1) Dummy 1: FULL random (efficiency may be < 1)
+            # 1) Dummy 1: FULL random
+            logger.info(f"  k={k}: Running Dummy 1 (Full Random)")  ### NEW LOG
             s_full = algo_full_random(full_g, k, run_seed)
             mid_full, k_eff_full, eff_full = evaluate_on_pruned(
                 pruned_g, pruned_osmid_to_idx, s_full, labels,
-                indptr, indices, data,
                 weight_attr=args.weight_attr,
                 eval_subset=eval_subset,
             )
@@ -309,11 +315,11 @@ def main():
                 **flat_full,
             })
 
-            # 2) Dummy 2: PRUNED random (efficiency ~ 1.0; k_eff might be <k if k>n)
+            # 2) Dummy 2: PRUNED random
+            logger.info(f"  k={k}: Running Dummy 2 (Pruned Random)") ### NEW LOG
             s_pr = algo_pruned_random(pruned_g, k, run_seed)
             mid_pr, k_eff_pr, eff_pr = evaluate_on_pruned(
                 pruned_g, pruned_osmid_to_idx, s_pr, labels,
-                indptr, indices, data,
                 weight_attr=args.weight_attr,
                 eval_subset=eval_subset,
             )
@@ -330,10 +336,17 @@ def main():
 
             # 3) Pipeline smart(s) on PRUNED
             for sm in smart_list:
-                s_sm = algo_pipeline_smart(pruned_g, k, run_seed, method=sm, weight_attr=args.weight_attr)
+                logger.info(f"    ... running Pipeline Smart ({sm}) k={k}") ### NEW LOG
+                
+                # Se 'sm' è 'hybrid', qui potrebbe impiegarci vari minuti per l'inizializzazione!
+                s_sm = algo_pipeline_smart(
+                    pruned_g, k, run_seed, method=sm,
+                    weight_attr=args.weight_attr,
+                    cached_city_order=cached_order
+                )
+                
                 mid_sm, k_eff_sm, eff_sm = evaluate_on_pruned(
                     pruned_g, pruned_osmid_to_idx, s_sm, labels,
-                    indptr, indices, data,
                     weight_attr=args.weight_attr,
                     eval_subset=eval_subset,
                 )
@@ -349,7 +362,7 @@ def main():
                 })
 
             logger.info(
-                f"k={k:4d} | eff(full)={eff_full:.2f} | cov(pr)={flat_pr['cov']:.3f} | cov(sm-1)={rows[-1]['cov']:.3f}"
+                f"k={k:4d} DONE | eff(full)={eff_full:.2f} | cov(pr)={flat_pr['cov']:.3f}"
             )
 
     df = pd.DataFrame(rows)

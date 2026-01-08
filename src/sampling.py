@@ -212,7 +212,7 @@ def _choose_city_representatives_max_degree(
     return reps
 
 
-def _fft_city_order(
+def compute_fft_city_order_optimized(
     g: ig.Graph,
     weight_attr: str | None = "length",
     seed: int | None = None,
@@ -221,6 +221,8 @@ def _fft_city_order(
     """
     Returns an ordering of communities (cities) using FFT on city representatives.
     Distance between cities i,j is shortest-path distance between their reps.
+    
+    Optimized: computes full pairwise distance matrix between reps upfront.
     """
     groups = _groups_by_community(g)
     city_ids = list(groups.keys())
@@ -230,52 +232,85 @@ def _fft_city_order(
     reps = _choose_city_representatives_max_degree(g, groups)
 
     # edge weights
-    if weight_attr is not None and weight_attr in g.es.attribute_names():
-        weights = list(map(float, g.es[weight_attr]))
-    else:
-        weights = None
+    # (igraph handles None weights correctly but strict check is fine)
+    if weight_attr is not None and weight_attr not in g.es.attribute_names():
+        weight_attr = None # Fallback to unweighted if attr missing
 
-    # choose seed city if not given
+    # 1. Prepare reps list aligned with city_ids
+    # We need a stable index -> city_id map
+    # (optional) stable tie-breaking shuffle of city list upfront
+    rng = np.random.default_rng(seed)
+    # Shuffle city_ids to ensure random tie-breaking during selection
+    # (Note: previous implementation reshuffled city_ids list)
+    rng.shuffle(city_ids)
+    
+    rep_list = [reps[cid] for cid in city_ids]
+    n_cities = len(city_ids)
+
+    # 2. Compute full distance matrix (n_cities x n_cities)
+    # use mode="all" for undirected robustness
+    d_mat = np.array(
+        g.shortest_paths(source=rep_list, target=rep_list, weights=weight_attr, mode="all"),
+        dtype=float
+    )
+    d_mat = _replace_infinite(d_mat) # Reuse helper to handle unreachability
+
+    # 3. Choose seed city if not given
     if seed_city is None:
         # pick city whose representative has highest degree
         deg = np.asarray(g.degree(), dtype=int)
-        seed_city = max(city_ids, key=lambda cid: deg[reps[cid]])
+        # Find index in *current shuffled city_ids* that has max degree rep
+        # Because we need the index for d_mat
+        best_idx = max(range(n_cities), key=lambda i: deg[rep_list[i]])
+    else:
+        # Find index of requested seed_city
+        try:
+            best_idx = city_ids.index(seed_city)
+        except ValueError:
+            # Fallback if seed_city not found, just pick 0
+            best_idx = 0
 
-    # (optional) stable tie-breaking shuffle of city list
-    rng = np.random.default_rng(seed)
-    city_ids = list(city_ids)
-    rng.shuffle(city_ids)
+    # 4. Greedy FFT on the matrix
+    # dist_to_centers: min dist from any center to city i
+    # Start with seed
+    current_center_idx = best_idx
+    
+    # We want exact set behavior.
+    # order stores city_ids
+    order = [city_ids[current_center_idx]]
+    chosen_indices = {current_center_idx}
+    
+    # Init distances: simply the row of the seed city
+    dist_to_centers = d_mat[current_center_idx].copy()
+    
+    # Mask self distance to avoid re-picking
+    dist_to_centers[current_center_idx] = -1.0 # Valid dists are >= 0
 
-    # Ensure seed_city is first in the internal list for determinism
-    if seed_city in city_ids:
-        city_ids.remove(seed_city)
-    city_ids.insert(0, seed_city)
-
-    rep_list = [reps[cid] for cid in city_ids]
-
-    # distances from first rep to all reps
-    d0 = np.array(g.shortest_paths(source=reps[seed_city], target=rep_list, weights=weights)[0], dtype=float)
-    d0 = _replace_infinite(d0)
-    dist_to_centers = d0.copy()
-
-    order = [int(seed_city)]
-    chosen = set(order)
-
-    # Build full FFT order over cities
-    while len(order) < len(city_ids):
-        idx = int(np.argmax(dist_to_centers))
-        cid = int(city_ids[idx])
-        if cid in chosen:
-            dist_to_centers[idx] = -np.inf
-            continue
-
-        order.append(cid)
-        chosen.add(cid)
-
-        dn = np.array(g.shortest_paths(source=reps[cid], target=rep_list, weights=weights)[0], dtype=float)
-        dn = _replace_infinite(dn)
-        dist_to_centers = np.minimum(dist_to_centers, dn)
-        dist_to_centers[idx] = -np.inf  # avoid reselecting same city
+    while len(order) < n_cities:
+        # Farthest point
+        next_idx = int(np.argmax(dist_to_centers))
+        
+        # Paranoia check: if next_idx in chosen_indices? 
+        # Should not happen if we masked it with -1
+        if next_idx in chosen_indices:
+             # This implies all remaining are -1? (Unreachable was replaced by large finite)
+             # Just pick any non-chosen
+             remaining = [i for i in range(n_cities) if i not in chosen_indices]
+             if not remaining:
+                 break
+             next_idx = remaining[0]
+        
+        order.append(city_ids[next_idx])
+        chosen_indices.add(next_idx)
+        
+        # Update distances
+        # New distance is min(existing, dist to new center)
+        # new center row in d_mat
+        new_dists = d_mat[next_idx]
+        dist_to_centers = np.minimum(dist_to_centers, new_dists)
+        
+        # Mask chosen
+        dist_to_centers[next_idx] = -1.0
 
     return order
 
@@ -287,6 +322,7 @@ def hybrid_city_ordered_round_robin(
     weight_attr: str | None = "length",
     reshuffle_within_city_on_reset: bool = True,
     reshuffle_city_order_on_reset: bool = True,
+    cached_city_order: list[int] | None = None,
 ) -> list[int]:
     """
     HYBRID sampler (GeoGuessr-style):
@@ -307,7 +343,12 @@ def hybrid_city_ordered_round_robin(
     rng = np.random.default_rng(seed)
 
     # 1) Distance-aware city order (FFT on reps)
-    city_order = _fft_city_order(g, weight_attr=weight_attr, seed=seed, seed_city=None)
+    if cached_city_order is not None:
+        # Use cached order (make copy to be safe if we shuffle later)
+        city_order = list(cached_city_order)
+    else:
+        city_order = compute_fft_city_order_optimized(g, weight_attr=weight_attr, seed=seed)
+    
     if not city_order:
         return []
 
@@ -362,19 +403,81 @@ def hybrid_city_ordered_round_robin(
 
 
 
-# Graph distance backend (CSR + multi-source Dijkstra)
+# Graph distance backend (igraph native)
+
+def _compute_nearest_center_dists(
+    g: ig.Graph,
+    sampled_nodes: List[int],
+    weight_attr: str | None = "length",
+    eval_subset: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute dist(x, S) and owner(x) for all x (or subset) using igraph.shortest_paths.
+
+    Args:
+        g: igraph Graph.
+        sampled_nodes: List of source nodes S.
+        weight_attr: Edge attribute for weights.
+        eval_subset: Optional array of target node indices. If None, targets=all.
+
+    Returns:
+        dist: 1D float array (len=n or len=eval_subset), dist to nearest center keys.
+        owner: 1D int array (same len), index in S that is nearest.
+               Returns values in [0, len(sampled_nodes)-1], or -1 if unreachable.
+    """
+    if not sampled_nodes:
+        # No centers -> infinite distance
+        n_targets = len(eval_subset) if eval_subset is not None else g.vcount()
+        return np.full(n_targets, np.inf), np.full(n_targets, -1, dtype=int)
+
+    # g.shortest_paths returns matrix [len(sampled_nodes) x len(targets)]
+    # We want min over columns (axis=0)
+    # Mode="out" or "all"? If undirected, "all". If directed, "out" usually implies from source to target.
+    # The user mentioned "robust to undirected graph", igraph handles this based on graph directedness.
+    # If the graph is directed but we want undirected behavior, we might need mode="all".
+    # Assuming standard shortest path 'out' from sources is correct for directed graphs
+    # or 'all' defaults for undirected.
+    
+    # targets:
+    if eval_subset is None:
+        targets = None # means all
+    else:
+        targets = list(eval_subset)
+
+    # This matrix can be large: K x N
+    d_matrix = g.shortest_paths(source=sampled_nodes, target=targets, weights=weight_attr, mode="all")
+    d_mat = np.array(d_matrix, dtype=float)
+
+    # Check for infinity
+    # igraph returns inf for unreachable
+    
+    # min over axis 0 (across sources)
+    # argmin gives index into sampled_nodes
+    
+    # We need to handle the case where a column is all inf (unreachable from any source)
+    # np.min will return inf, which is correct for dist.
+    # np.argmin will return 0 (first index), which is misleading if dist is inf.
+    
+    dist = np.min(d_mat, axis=0)
+    owner_idx = np.argmin(d_mat, axis=0)
+    
+    # Fix owner for unreachable
+    # If dist is inf, set owner to -1
+    mask_inf = np.isinf(dist)
+    if np.any(mask_inf):
+        owner_idx[mask_inf] = -1
+        
+        # Replace inf in dist with finite replacement (for stats) similar to old _replace_infinite?
+        # The old metric_global_coverage_from_dist calls _replace_infinite safely.
+        # But let's check if we removed _replace_infinite helper. Yes we did.
+        # We should probably keep a helper or handle it here. 
+        # Actually, let's restore a helper for replacing infinite because metric functions use it.
+    
+    return dist, owner_idx
+
 def _replace_infinite(x: np.ndarray) -> np.ndarray:
     """
     Replace ``inf`` entries in a distance array with a finite sentinel.
-    
-    This is useful when shortest-path queries return ``inf`` for disconnected graphs.
-    The sentinel is chosen as ``max_finite + 1`` (or 0 if all entries are infinite).
-    
-    Args:
-        dist: Numpy array of distances.
-    
-    Returns:
-        A float array with all infinite values replaced.
     """
     x = np.array(x, dtype=float)
     inf = ~np.isfinite(x)
@@ -383,102 +486,6 @@ def _replace_infinite(x: np.ndarray) -> np.ndarray:
         mx = np.max(finite) if finite.size else 1.0
         x[inf] = mx * 10.0
     return x
-
-
-def build_csr_adjacency(g: ig.Graph, weight_attr: str | None = "length") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build a CSR adjacency representation for fast Dijkstra.
-    
-    Args:
-        g: igraph graph (treated as undirected; both directions are stored).
-        weight_attr: Edge attribute to use as weight. If missing/None, uses weight 1.0.
-    
-    Returns:
-        (indptr, indices, data) in CSR format, where each edge is stored in both directions.
-    
-    Notes:
-        The output is suitable for ``multisource_dijkstra`` below.
-    """
-    n = g.vcount()
-    m = g.ecount()
-
-    edges = np.array(g.get_edgelist(), dtype=np.int32)  # (m,2)
-    u0 = edges[:, 0]
-    v0 = edges[:, 1]
-
-    # Undirected: store both directions
-    u = np.concatenate([u0, v0])
-    v = np.concatenate([v0, u0])
-
-    if weight_attr is not None and weight_attr in g.es.attribute_names():
-        w0 = np.array(g.es[weight_attr], dtype=np.float64)
-        w = np.concatenate([w0, w0])
-    else:
-        w = np.ones(u.shape[0], dtype=np.float64)
-
-    order = np.argsort(u, kind="mergesort")
-    u = u[order]
-    v = v[order]
-    w = w[order]
-
-    counts = np.bincount(u, minlength=n)
-    indptr = np.zeros(n + 1, dtype=np.int64)
-    indptr[1:] = np.cumsum(counts)
-
-    indices = v.astype(np.int32, copy=False)
-    data = w.astype(np.float64, copy=False)
-    return indptr, indices, data
-
-
-def multisource_dijkstra(
-    indptr: np.ndarray,
-    indices: np.ndarray,
-    data: np.ndarray,
-    sources: List[int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute nearest-center distances with a single multi-source Dijkstra.
-    
-    Given a set of source vertices S, computes:
-        dist[x]  = min_{s in S} d(s, x)
-        owner[x] = argmin source s (index into the provided ``sources`` list)
-    
-    Args:
-        indptr, indices, data: CSR adjacency as built by ``build_csr_adjacency``.
-        sources: Iterable of source vertex indices.
-    
-    Returns:
-        dist: 1D float array of length n (inf if unreachable).
-        owner: 1D int array of length n with values in [0, len(sources)-1], or -1 if unreachable.
-    """
-    n = len(indptr) - 1
-    dist = np.full(n, np.inf, dtype=np.float64)
-    owner = np.full(n, -1, dtype=np.int32)
-
-    h: list[tuple[float, int]] = []
-
-    for s in sources:
-        s = int(s)
-        if dist[s] > 0.0:
-            dist[s] = 0.0
-            owner[s] = s
-            heapq.heappush(h, (0.0, s))
-
-    while h:
-        d_u, u = heapq.heappop(h)
-        if d_u != dist[u]:
-            continue
-
-        start, end = indptr[u], indptr[u + 1]
-        for ei in range(start, end):
-            v = int(indices[ei])
-            alt = d_u + float(data[ei])
-            if alt < dist[v]:
-                dist[v] = alt
-                owner[v] = owner[u]
-                heapq.heappush(h, (alt, v))
-
-    return dist, owner
 
 
 # ============================================================
@@ -662,9 +669,6 @@ def evaluate_midterm(
     g: ig.Graph,
     labels_full: np.ndarray,
     sampled_nodes: List[int],
-    indptr: np.ndarray,
-    indices: np.ndarray,
-    data: np.ndarray,
     eval_subset: Optional[np.ndarray] = None,
     weight_attr: str | None = "length",
 ) -> Dict[str, Any]:
@@ -673,10 +677,10 @@ def evaluate_midterm(
     
     Args:
         g: igraph graph.
+        labels_full: 1D array of community id per vertex.
         sampled_nodes: Sampled vertex indices S.
-        weight_attr: Edge attribute used as distance.
         eval_subset: Optional subset of vertices to approximate global metrics (speed-up).
-        csr_cache: Optional tuple (indptr, indices, data) to reuse CSR adjacency.
+        weight_attr: Edge attribute used as distance.
     
     Returns:
         Dict aggregating:
@@ -688,24 +692,22 @@ def evaluate_midterm(
     """
     sampled_nodes = list(map(int, sampled_nodes))
 
-    # Multi-source Dijkstra gives dist to nearest sampled node + "owner" (nearest sampled id)
-    dist_all, owner_all = multisource_dijkstra(indptr, indices, data, sources=sampled_nodes)
+    # Compute dist to nearest sampled node + "owner" (index of nearest sampled node)
+    dist_eval, owner_idx_eval = _compute_nearest_center_dists(
+        g, sampled_nodes, weight_attr=weight_attr, eval_subset=eval_subset
+    )
 
     if eval_subset is not None:
         eval_subset = np.asarray(eval_subset, dtype=int)
-        dist_eval = dist_all[eval_subset]
-        owner_eval = owner_all[eval_subset]
         labels_eval = np.asarray(labels_full)[eval_subset]
     else:
-        dist_eval = dist_all
-        owner_eval = owner_all
         labels_eval = np.asarray(labels_full)
 
     cov = metric_community_coverage(labels_full, sampled_nodes)
     bal = metric_balance(cov["counts_per_community"])
     glob = metric_global_coverage_from_dist(dist_eval)
     div = metric_diversity_pairwise(g, sampled_nodes, weight_attr=weight_attr)
-    agree = metric_clustering_agreement(labels_eval, owner_eval)
+    agree = metric_clustering_agreement(labels_eval, owner_idx_eval)
 
     return {
         "community_coverage": cov,
@@ -755,8 +757,8 @@ def main():
 
     labels = np.array(g.vs["community"], dtype=int)
 
-    # Precompute CSR adjacency once (big win)
-    indptr, indices, data = build_csr_adjacency(g, weight_attr=args.weight_attr)
+    # Precompute CSR once (big win) -> Removed in favor of igraph
+    # indptr, indices, data = build_csr_adjacency(g, weight_attr=args.weight_attr)
 
     rng = np.random.default_rng(args.seed)
     eval_subset = None
@@ -768,8 +770,8 @@ def main():
         S_rr = sample_round_robin(g, k, seed=args.seed)
         S_fft = fft_sample_graph(g, k, weight_attr=args.weight_attr, seed_idx=None)
 
-        met_rr = evaluate_midterm(g, labels, S_rr, indptr, indices, data, eval_subset=eval_subset, weight_attr=args.weight_attr)
-        met_fft = evaluate_midterm(g, labels, S_fft, indptr, indices, data, eval_subset=eval_subset, weight_attr=args.weight_attr)
+        met_rr = evaluate_midterm(g, labels, S_rr, eval_subset=eval_subset, weight_attr=args.weight_attr)
+        met_fft = evaluate_midterm(g, labels, S_fft, eval_subset=eval_subset, weight_attr=args.weight_attr)
 
         rows.append({
             "k": int(k),

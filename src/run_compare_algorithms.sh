@@ -34,7 +34,7 @@ echo "Pruned Graph: $PRUNED_GRAPH"
 python3 compare_algorithms.py \
     --full "$FULL_GRAPH" \
     --pruned "$PRUNED_GRAPH" \
-    --output "$OUTPUT_DIR" \
+    --outdir "$OUTPUT_DIR" \
     --ks 10 20 50 100 200 500 \
     --seed 42
 
