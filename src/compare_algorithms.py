@@ -43,6 +43,7 @@ from sampling import (
     compute_fft_city_order_optimized,
     evaluate_midterm,
 )
+from fix_connectivity import connect_graph_components
 
 logging.basicConfig(
     level=logging.INFO,
@@ -261,6 +262,9 @@ def main():
     pruned_pkg = load_graph_pkg(args.pruned)
     full_g = full_pkg["graph"]
     pruned_g = pruned_pkg["graph"]
+
+    # FIX: Ensure graph is connected for metric calculation (virtual edges)
+    pruned_g = connect_graph_components(pruned_g, weight_attr=args.weight_attr)
 
     if "community" not in pruned_g.vs.attribute_names():
         raise ValueError("Pruned graph must have vertex attribute 'community' (run Leiden first).")
