@@ -29,7 +29,7 @@ OUTPUT_COMMS="nord_est_with_communities.pkl"
 echo "Using input: $INPUT_PRUNED"
 
 # Run Script
-python3 leiden_communities_undirected.py --input "$INPUT_PRUNED" --output "$OUTPUT_COMMS" --objective modularity
+python3 leiden_communities_undirected.py --input "$INPUT_PRUNED" --output "$OUTPUT_COMMS" --objective CPM
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Leiden detection failed."
