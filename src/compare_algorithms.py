@@ -35,13 +35,18 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
 
 from sampling import (
     sample_round_robin,
     fft_sample_graph,
     hybrid_city_ordered_round_robin,
     compute_fft_city_order_optimized,
+    compute_fft_order_from_distance_matrix,
     evaluate_midterm,
+    _groups_by_community,
+    _choose_city_representatives_max_degree,
+    _replace_infinite,
 )
 from fix_connectivity import connect_graph_components
 
@@ -275,6 +280,29 @@ def main():
     logger.info(f"Full graph:   n={full_g.vcount():,}, m={full_g.ecount():,}")
     logger.info(f"Pruned graph: n={pruned_g.vcount():,}, m={pruned_g.ecount():,}")
 
+    # Precompute distance matrix for hybrid FFT order
+    groups = _groups_by_community(pruned_g)
+    reps = _choose_city_representatives_max_degree(pruned_g, groups)
+    city_ids = list(groups.keys())
+    rep_list = [reps[cid] for cid in city_ids]
+    
+    if "x" in pruned_g.vs.attribute_names() and "y" in pruned_g.vs.attribute_names():
+        # Use Euclidean distance as fast approximation
+        rep_coords = np.array([[pruned_g.vs[rep]["x"], pruned_g.vs[rep]["y"]] for rep in rep_list])
+        d_mat = cdist(rep_coords, rep_coords, metric='euclidean')
+        logger.info(f"Using Euclidean distance approximation for {len(city_ids)} communities.")
+    else:
+        # Fallback to graph shortest paths
+        d_mat = np.array(
+            pruned_g.shortest_paths(source=rep_list, target=rep_list, weights=args.weight_attr, mode="all"),
+            dtype=float
+        )
+        d_mat = _replace_infinite(d_mat)
+        logger.info(f"Using graph shortest paths for {len(city_ids)} communities.")
+    
+    deg = np.asarray(pruned_g.degree(), dtype=int)
+    logger.info(f"Precomputed distance matrix for {len(city_ids)} communities.")
+
     # Precompute CSR once (major speedup) -> Replaced by igraph
     # indptr, indices, data = build_csr_adjacency(pruned_g, weight_attr=args.weight_attr)
 
@@ -297,7 +325,7 @@ def main():
         cached_order = None
         if "hybrid" in smart_list:
             logger.info("  Precomputing community FFT order (optimized)...")
-            cached_order = compute_fft_city_order_optimized(pruned_g, weight_attr=args.weight_attr, seed=run_seed)
+            cached_order = compute_fft_order_from_distance_matrix(d_mat, city_ids, reps, deg, seed=run_seed)
 
         for k in args.ks:
             # 1) Dummy 1: FULL random

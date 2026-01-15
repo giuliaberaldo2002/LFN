@@ -107,10 +107,19 @@ def connect_graph_components(g: ig.Graph, weight_attr: str = "length") -> ig.Gra
     weights_to_add = []
     
     # Add MST edges
+    # Scipy MST returns a matrix where (i, j) exists. It might not be symmetric (parent->child).
+    # We must not filter with i < j blindly. We should deduplicate.
     mst_coo = mst.tocoo()
+    seen_edges = set()
+    
     for i, j, d in zip(mst_coo.row, mst_coo.col, mst_coo.data):
-        if i < j:
-            edges_to_add.append((reps_indices[i], reps_indices[j]))
+        # Normalize edge direction for undirected graph
+        if i == j: continue # Should not happen in MST but good practice
+        u, v = (i, j) if i < j else (j, i)
+        
+        if (u, v) not in seen_edges:
+            seen_edges.add((u, v))
+            edges_to_add.append((reps_indices[u], reps_indices[v]))
             weights_to_add.append(d)
 
     # 6. Bridge any remaining disconnected components in the MST logic
