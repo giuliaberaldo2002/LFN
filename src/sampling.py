@@ -342,19 +342,31 @@ def hybrid_city_ordered_round_robin(
 
     rng = np.random.default_rng(seed)
 
-    # 1) Distance-aware city order (FFT on reps)
-    if cached_city_order is not None:
-        # Use cached order (make copy to be safe if we shuffle later)
-        city_order = list(cached_city_order)
-    else:
-        city_order = compute_fft_city_order_optimized(g, weight_attr=weight_attr, seed=seed)
-    
-    if not city_order:
+    groups = _groups_by_community(g)
+    M = len(groups)
+    if M == 0:
         return []
 
-    # 2) Build pools per city (shuffled), sample without replacement inside each city
-    groups = _groups_by_community(g)
+    # 1) city order
+    if cached_city_order is not None:
+        city_order = list(cached_city_order)
+    else:
+        t = min(M, k)
+        city_order = compute_fft_city_order_streaming(
+            g,
+            weight_attr=weight_attr,
+            seed=seed,
+            max_cities=t,
+        )
 
+    # keep only communities that exist in this graph
+    city_order = [int(cid) for cid in city_order if int(cid) in groups]
+
+    # fallback if something went wrong
+    if not city_order:
+        city_order = list(groups.keys())
+
+    # 2) pools per city (no replacement)
     def build_pools() -> dict[int, list[int]]:
         pools = {cid: list(nodes) for cid, nodes in groups.items()}
         if reshuffle_within_city_on_reset:
@@ -363,17 +375,15 @@ def hybrid_city_ordered_round_robin(
         return pools
 
     pools = build_pools()
-    total_nodes = sum(len(v) for v in pools.values())
-    if total_nodes == 0:
+    if sum(len(v) for v in pools.values()) == 0:
         return []
 
     samples: list[int] = []
-    city_pos = 0  # pointer into city_order
+    city_pos = 0
 
     while len(samples) < k:
         progressed = False
 
-        # one “pass” over the city order
         for _ in range(len(city_order)):
             if len(samples) >= k:
                 break
@@ -388,20 +398,126 @@ def hybrid_city_ordered_round_robin(
         if progressed:
             continue
 
-        # No progress => all pools empty => RESET
+        # RESET: all pools empty
         pools = build_pools()
 
         if reshuffle_city_order_on_reset:
             rng.shuffle(city_order)
             city_pos = 0
 
-        # (very degenerate) if still empty, break
         if all(len(pools[cid]) == 0 for cid in city_order):
             break
 
     return samples
 
 
+def compute_fft_city_order_streaming(
+    g: ig.Graph,
+    weight_attr: str | None = "length",
+    seed: int | None = None,
+    max_cities: int | None = None,
+) -> list[int]:
+    """
+    Streaming FFT order over cities (Leiden communities), using only rep-to-all distances per step.
+
+    - Picks one representative vertex per city (community).
+    - Runs farthest-first traversal over cities, where distance between cities
+      is the graph shortest-path distance between their representatives.
+    - Computes only the first `max_cities` cities (like: min(k, M)).
+
+    Complexity: O(t * SSSP) where t = max_cities (not M^2).
+    Memory: O(M) for rep arrays + O(n) for one distance vector per step.
+    """
+    if "community" not in g.vs.attribute_names():
+        raise ValueError("Vertex attribute 'community' is required.")
+
+    rng = np.random.default_rng(seed)
+
+    # Edge weights (length)
+    if weight_attr is not None and weight_attr in g.es.attribute_names():
+        weights = list(map(float, g.es[weight_attr]))
+    else:
+        weights = None
+
+    # --- Build groups: city_id -> list[vertex]
+    comm = np.asarray(g.vs["community"], dtype=int)
+    # Map community labels to contiguous 0..M-1 for compact arrays
+    unique_cids = np.unique(comm)
+    M = unique_cids.size
+    cid_to_pos = {int(cid): i for i, cid in enumerate(unique_cids)}
+    # gather nodes per city (only if needed for rep selection)
+    groups: dict[int, list[int]] = {}
+    for v, cid in enumerate(comm):
+        groups.setdefault(int(cid), []).append(int(v))
+
+    # max_cities
+    if max_cities is None:
+        t = M
+    else:
+        t = min(int(max_cities), M)
+    if t <= 0:
+        return []
+
+    # --- Choose one representative per city
+    # Here: pick max-degree node within the city (stable and meaningful).
+    degrees = np.asarray(g.degree(), dtype=int)
+    rep_vertex = np.empty(M, dtype=int)
+    for cid in unique_cids:
+        nodes = groups[int(cid)]
+        # argmax degree within nodes
+        best = max(nodes, key=lambda v: degrees[v])
+        rep_vertex[cid_to_pos[int(cid)]] = int(best)
+
+    # --- Initialize FFT over cities (on reps)
+    # pick initial city: the one whose rep has maximum degree (or random if you prefer)
+    start_city_pos = int(np.argmax(degrees[rep_vertex]))
+    chosen = np.zeros(M, dtype=bool)
+    chosen[start_city_pos] = True
+
+    order_pos = [start_city_pos]
+
+    # distance from each city to nearest chosen center (over reps)
+    # start by distances from the first rep to ALL vertices, then read at rep positions
+    dist_all = np.asarray(g.distances(source=int(rep_vertex[start_city_pos]), weights=weights)[0], dtype=float)
+    # handle inf if disconnected
+    inf = ~np.isfinite(dist_all)
+    if inf.any():
+        finite = dist_all[~inf]
+        max_finite = float(np.max(finite)) if finite.size else 1.0
+        dist_all[inf] = max_finite * 10.0
+
+    dist_to_centers = dist_all[rep_vertex].copy()  # length M
+
+    # --- Iteratively add farthest cities
+    while len(order_pos) < t:
+        # choose the city with maximum distance to current centers
+        # (excluding already chosen)
+        dist_masked = dist_to_centers.copy()
+        dist_masked[chosen] = -1.0
+        next_city_pos = int(np.argmax(dist_masked))
+        if dist_masked[next_city_pos] < 0:
+            break  # no more cities
+
+        chosen[next_city_pos] = True
+        order_pos.append(next_city_pos)
+
+        # update distances using new center
+        dist_all = np.asarray(g.distances(source=int(rep_vertex[next_city_pos]), weights=weights)[0], dtype=float)
+        inf = ~np.isfinite(dist_all)
+        if inf.any():
+            finite = dist_all[~inf]
+            max_finite = float(np.max(finite)) if finite.size else 1.0
+            dist_all[inf] = max_finite * 10.0
+
+        dist_new = dist_all[rep_vertex]
+        dist_to_centers = np.minimum(dist_to_centers, dist_new)
+
+    # convert back to original community ids in that order
+    order_cids = [int(unique_cids[p]) for p in order_pos]
+
+    # Optional: if you need a full cyclic order even when t < M, you can append remaining cities randomly
+    # but for hybrid we typically only need first pass up to min(k, M).
+    return order_cids
 
 # Graph distance backend (igraph native)
 
