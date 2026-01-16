@@ -1,22 +1,30 @@
-#!/usr/bin/env python3
 """
-----------------------------
-Sampling + evaluation according to the metrics defined below.
+sampling.py
+-----------
+Core module for graph sampling algorithms and evaluation metrics.
+Provides implementations for various node sampling strategies and a suite of metrics
+to assess the quality of the sampled set (coverage, diversity, balance).
 
-Distance definition:
-- use shortest-path distance on the road graph as underlying d(·,·)
-  (weighted if edge weights are available, else hop distance).
+Sampling Algorithms:
+  1. Round Robin (Community-based):
+     - Iterates through communities, picking one node from each in turn.
+     - Ensures fair representation of all clusters.
+  2. Farthest-First Traversal (FFT):
+     - Greedy approximation of the k-center problem.
+     - Selects nodes that are farthest from the already selected set.
+  3. Hybrid (City-Ordered Round Robin):
+     - Orders communities (cities) using FFT (spatial spread).
+     - Then performs Round Robin sampling following that city order.
 
-Metrics:
-- Community coverage: |{ i : Ci \cap S notin \empty }| / k, plus distribution of |Ci \cap S| 
-- Global coverage (k-center style): d(x,S)=min_{y\inS} d(x,y); report R=max_x d(x,S), mean/median/p90 
-- Diversity among sampled points: pairwise distances d(si,sj), min separation + stats
-- Balance across communities: CV = sigma(ni)/mu(ni) or entropy-based score 
+Evaluation Metrics:
+  - Community Coverage: Fraction of communities represented.
+  - Global Coverage: k-center objective (min max distance from any node to the sample).
+  - Diversity: Pairwise distances between sampled nodes (min separation, mean).
+  - Balance: Entropy and Coefficient of Variation of samples per community.
 
-Optimizations:
-- Multi-source Dijkstra (single run) to compute d(x,S) for all x and also nearest-center assignment.
-- Optional evaluation on a subset of nodes to reduce runtime for huge graphs.
-
+Usage:
+  - Imported by `compare_algorithms.py`.
+  - Can also be run directly to execute a standard evaluation experiment (via `main()`).
 """
 
 import os
@@ -39,9 +47,11 @@ except ImportError:
     _HAS_SKLEARN = False
 
 
-# Sampling methods
+# -------------------------
+# Sampling Algorithms
+# -------------------------
 
-# 1 Round Robin 
+# 1. Round Robin Sampler 
 def sample_round_robin(
     g: ig.Graph,
     k: int,
@@ -73,6 +83,8 @@ def sample_round_robin(
     # Build initial pools per community
     pools: dict[int, list[int]] = defaultdict(list)
     for v, c in enumerate(comm):
+        if int(c) == -1:  # FIX: Ignora nodi non appartenenti alle community valide
+            continue
         pools[int(c)].append(int(v))
 
     community_ids = list(pools.keys())
@@ -129,7 +141,7 @@ def sample_round_robin(
     return samples
 
 
-# 2 fft 
+# 2. Farthest-First Traversal (FFT) 
 def fft_sample_graph(
     g: ig.Graph,
     k: int,
@@ -193,7 +205,8 @@ def _groups_by_community(g: ig.Graph) -> dict[int, list[int]]:
     comm = np.asarray(g.vs["community"], dtype=int)
     groups: dict[int, list[int]] = defaultdict(list)
     for v, c in enumerate(comm):
-        groups[int(c)].append(int(v))
+        if c != -1:  # Ignore communities not in top 300
+            groups[int(c)].append(int(v))
     return groups
 
 
@@ -314,7 +327,56 @@ def compute_fft_city_order_optimized(
 
     return order
 
-# 3 hybrid
+
+def compute_fft_order_from_distance_matrix(
+    d_mat: np.ndarray,
+    city_ids: list[int],
+    reps: dict[int, int],
+    deg: np.ndarray,
+    seed: int | None = None,
+) -> list[int]:
+    """
+    Compute FFT order given a precomputed distance matrix between city representatives.
+    d_mat must be (N, N) where N = len(city_ids), aligned with city_ids order.
+    """
+    n_cities = len(city_ids)
+    if n_cities == 0:
+        return []
+
+    rep_list = [reps[cid] for cid in city_ids]
+
+    # 1. Choose seed city if not given (max degree rep)
+    # (We map rep_list index -> degree)
+    # Note: deg is array of graph degrees
+    best_idx = int(max(range(n_cities), key=lambda i: deg[rep_list[i]]))
+
+    # 2. Greedy FFT on the matrix
+    current_center_idx = best_idx
+    order = [city_ids[current_center_idx]]
+    chosen_indices = {current_center_idx}
+    
+    dist_to_centers = d_mat[current_center_idx].copy()
+    dist_to_centers[current_center_idx] = -1.0
+    
+    while len(order) < n_cities:
+        next_idx = int(np.argmax(dist_to_centers))
+        
+        if next_idx in chosen_indices:
+             remaining = [i for i in range(n_cities) if i not in chosen_indices]
+             if not remaining:
+                 break
+             next_idx = remaining[0]
+        
+        order.append(city_ids[next_idx])
+        chosen_indices.add(next_idx)
+        
+        new_dists = d_mat[next_idx]
+        dist_to_centers = np.minimum(dist_to_centers, new_dists)
+        dist_to_centers[next_idx] = -1.0
+
+    return order
+
+# 3. Hybrid Sampler (City-Ordered)
 def hybrid_city_ordered_round_robin(
     g: ig.Graph,
     k: int,
@@ -625,6 +687,8 @@ def metric_community_coverage(labels_full: np.ndarray, sampled_nodes: List[int])
     """
     labels_full = np.asarray(labels_full)
     comms_full = np.unique(labels_full)
+    # Exclude -1 (communities not in top 300)
+    comms_full = comms_full[comms_full != -1]
     n_full = int(len(comms_full))
 
     if len(sampled_nodes) == 0:

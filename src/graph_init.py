@@ -1,3 +1,29 @@
+"""
+graph_init_corrected.py
+-----------------------
+Step 1 of the pipeline: Initialization and Parsing.
+Parses the input OSM PBF file and converts it into a clean, processable graph structure.
+
+Key Steps:
+  1. Parses the .osm.pbf file using Pyrosm (fastest parser).
+  2. Converts the raw OSM data into a NetworkX MultiDiGraph.
+  3. Simplifies the graph topology using OSMnx (merges interstitial nodes).
+  4. Enriches edges with travel time and speed information.
+  5. Converts the finalized graph to iGraph for performance in later steps.
+  6. Serializes the output (graph + metadata) to a pickle file.
+
+Inputs:
+  - data/bremen-251019.osm.pbf: Raw OpenStreetMap data in PBF format.
+
+Outputs:
+  - bremen_processed_graph.pkl: Dict containing:
+      - 'graph': The processed iGraph object.
+      - 'osmid_map': Mapping from internal index to original OSM ID.
+      - 'crs': Coordinate reference system (EPSG:4326).
+
+Dependencies: pyrosm, networkx, osmnx, igraph, pandas, psutil
+"""
+
 import pyrosm
 import networkx as nx
 import osmnx as ox
@@ -9,9 +35,12 @@ import sys
 import psutil
 import os
 
-FP =  "data/bremen-251019.osm.pbf"  # "bremen-251019.osm.pbf" 
-OUTPUT_PKL = "bremen_processed_graph.pkl"
-NETWORK_TYPE = "driving"
+# ---------------------------------------------------------
+# Configuration / Global Constants
+# ---------------------------------------------------------
+FP = "data/bremen-251019.osm.pbf"    # Input PBF file path
+OUTPUT_PKL = "bremen_processed_graph.pkl" # Output pickle file path
+NETWORK_TYPE = "driving"             # Type of network to extract (driving, walking, etc.)
 
 def log_resource_usage():
     process = psutil.Process(os.getpid())

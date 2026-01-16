@@ -1,30 +1,26 @@
 """
 leiden_communities_undirected.py
+--------------------------------
+Performs Leiden community detection on the pruned graph.
+This script ensures the graph is treated as undirected during the clustering process
+to avoid directionality bias in community formation.
 
-Run Leiden community detection on a (possibly directed) pruned road graph and
-save the graph with a vertex-level "community" label.
+Logic:
+  1. Loads the pruned graph.
+  2. Converts to undirected (if directed), collapsing edges with min-weight strategy.
+  3. Prepares edge weights (inverse of length) for the optimization objective.
+  4. Runs a parameter sweep on the resolution parameter (gamma) for Leiden (CPM or Modularity).
+  5. Selects the partition with the highest quality score.
+  6. Filters to keep only the top N communities (by size), setting others to -1.
+  7. Saves the graph with a new 'community' vertex attribute.
 
-Input:
-- A pickle containing either:
-  - an igraph.Graph, or
-  - a dict with key "graph" -> igraph.Graph.
+Inputs:
+  - --input: Pruned graph pickle.
+  - --top_n: Number of largest communities to retain (default: 300).
+  - --objective: Optimization function ('CPM' or 'modularity').
 
-Processing:
-- If the graph is directed, create an undirected working copy for Leiden via
-  edge collapse (combining attributes like length/weight by mean).
-- Choose edge weights if available ("length" preferred, otherwise "weight";
-  otherwise unweighted Leiden).
-- Run a small resolution (gamma) sweep depending on objective:
-  - CPM: small resolution values
-- Select the partition with the best reported quality (q) and write
-  membership to the ORIGINAL graph as:  Gp.vs["community"] = membership
-
-Output:
-- A pickle saved to --output. If the input was a dict package, the same dict
-  is copied and its "graph" entry is replaced with the updated graph.
-
-CLI:
-  --input, --output, --objective {CPM, modularity}
+Outputs:
+  - Saves the graph with updated 'community' labels to the output path.
 """
 
 import argparse
@@ -33,152 +29,62 @@ import pickle
 import numpy as np
 import sys
 import os
-from collections import Counter, defaultdict
 
-
+# -----------------------
+# Constants & Defaults
+# -----------------------
 DEFAULT_INPUT = "nord_est_pruned_graph.pkl"
 DEFAULT_OUTPUT = "nord_est_pruned_with_communities.pkl"
 
 
-def summarize_partition(part: ig.clustering.VertexClustering):
-    sizes = np.array(part.sizes(), dtype=int)
+# -----------------------
+# Helper Functions
+# -----------------------
+
+def summarize_partition(part):
+    """Computes summary statistics for a given partition."""
+    sizes = np.array(part.sizes())
     return {
-        "n_communities": int(len(part)),
+        "n_communities": len(part),
         "quality": float(part.q),
         "size_min": int(sizes.min()),
         "size_median": float(np.median(sizes)),
-        "size_p10": float(np.percentile(sizes, 10)),
-        "size_p90": float(np.percentile(sizes, 90)),
         "size_max": int(sizes.max()),
-        "frac_singletons": float(np.mean(sizes == 1)),
-        "frac_leq2": float(np.mean(sizes <= 2)),
     }
 
-
-def run_leiden_once(g: ig.Graph, gamma: float, objective: str, weights, n_iterations: int, seed: int):
-    # igraph versions may differ on resolution parameter name.
-    try:
-        return g.community_leiden(
-            objective_function=objective,
-            weights=weights,
-            resolution_parameter=gamma,
-            n_iterations=n_iterations,
-            seed=seed,
-        )
-    except TypeError:
-        # fallback for older igraph
-        return g.community_leiden(
+def run_leiden_tuning(g, gammas, objective="CPM", weights=None, n_iterations=10):
+    """
+    Runs Leiden optimization for a list of gamma values.
+    Returns a list of results containing the partition and its stats.
+    """
+    results = []
+    for gamma in gammas:
+        print(f"\n=== Gamma = {gamma} ===")
+        part = g.community_leiden(
             objective_function=objective,
             weights=weights,
             resolution=gamma,
             n_iterations=n_iterations,
-            seed=seed,
         )
-
-
-def run_leiden_tuning(g: ig.Graph, gammas, objective="CPM", weights=None, n_iterations=10, seed=0):
-    results = []
-    for gamma in gammas:
-        print(f"\n=== Gamma = {gamma:.2e} ===")
-        part = run_leiden_once(g, gamma, objective, weights, n_iterations, seed)
         stats = summarize_partition(part)
-
         results.append({"gamma": gamma, "partition": part, "stats": stats})
-
-        print(
-            f" n_comm={stats['n_communities']:,}"
-            f" | size[min/med/max]={stats['size_min']}/{stats['size_median']:.1f}/{stats['size_max']}"
-            f" | p10/p90={stats['size_p10']:.1f}/{stats['size_p90']:.1f}"
-            f" | singletons={100*stats['frac_singletons']:.1f}%"
-            f" | q={stats['quality']:.4f}"
-        )
+        print(f" communities: {stats['n_communities']} | quality (q) = {stats['quality']:.4f}")
     return results
 
 
-def pick_best_gamma(results, max_singletons=0.30, min_median_size=10.0):
-    # Filter partitions that look “city-like”
-    candidates = [
-        r for r in results
-        if (r["stats"]["frac_singletons"] <= max_singletons)
-        and (r["stats"]["size_median"] >= min_median_size)
-    ]
-
-    if not candidates:
-        print("\nWARNING: no gamma satisfies constraints; falling back to max q.")
-        return max(results, key=lambda r: r["stats"]["quality"])
-
-    # tie-break by quality among feasible candidates
-    return max(candidates, key=lambda r: r["stats"]["quality"])
-
-
-def merge_tiny_communities(g: ig.Graph, labels: list[int], s_min: int = 10, passes: int = 2) -> list[int]:
-    """
-    Merge communities with size < s_min into the most frequent neighboring community.
-    Works on the current graph topology (undirected recommended).
-    """
-    labels = list(map(int, labels))
-    n = g.vcount()
-
-    for _ in range(passes):
-        # build size table
-        sizes = Counter(labels)
-
-        # group nodes by community
-        comm_nodes = defaultdict(list)
-        for v, c in enumerate(labels):
-            comm_nodes[c].append(v)
-
-        # identify tiny communities
-        tiny = [c for c, sz in sizes.items() if sz < s_min]
-        if not tiny:
-            break
-
-        changed = 0
-
-        for c in tiny:
-            nodes = comm_nodes[c]
-            if not nodes:
-                continue
-
-            neighbor_comms = Counter()
-
-            # look at boundary neighbors
-            for v in nodes:
-                for u in g.neighbors(v):
-                    cu = labels[u]
-                    if cu != c:
-                        neighbor_comms[cu] += 1
-
-            if not neighbor_comms:
-                # isolated tiny component: skip (or you could assign to closest by coord if you want)
-                continue
-
-            # pick most frequent neighboring community
-            target = neighbor_comms.most_common(1)[0][0]
-
-            # reassign all nodes in c
-            for v in nodes:
-                labels[v] = target
-            changed += 1
-
-        if changed == 0:
-            break
-
-    return labels
-
-
+# -----------------------
+# Main Execution
+# -----------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Leiden (CPM or modularity) on pruned graph + tune gamma.")
+    parser = argparse.ArgumentParser(description="Run Leiden Community Detection on Pruned Graph")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pruned graph pickle")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output graph with community labels pickle")
     parser.add_argument("--objective", default="CPM", choices=["CPM", "modularity"], help="Leiden objective function")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max_singletons", type=float, default=0.30)
-    parser.add_argument("--min_median_size", type=float, default=10.0)
+    parser.add_argument("--top_n", type=int, default=300, help="Number of top communities to keep")
     args = parser.parse_args()
 
-    # --- Load graph package ---
+    # 1. Load Graph
     if not os.path.exists(args.input):
         print(f"ERROR: {args.input} not found.")
         sys.exit(1)
@@ -186,93 +92,82 @@ def main():
     print(f"Loading graph from {args.input}...")
     with open(args.input, "rb") as f:
         data_pkg = pickle.load(f)
-    if isinstance(data_pkg, dict) and "graph" in data_pkg:
-        Gp = data_pkg["graph"]
-    else:
-        # allow pickled igraph directly
-        Gp = data_pkg
-
+    Gp = data_pkg["graph"]
     print(f"Loaded pruned graph. Nodes: {Gp.vcount():,}, Edges: {Gp.ecount():,}")
 
-    # --- Undirected copy for Leiden ---
+    # 2. Prepare Undirected Graph for Clustering
+    # Leiden works best on undirected graphs for spatial clustering.
+    # We collapse multi-edges by taking the minimum length (or weight).
     if Gp.is_directed():
-        print("Graph is directed. Creating undirected copy (collapse) for Leiden...")
+        print("Graph is directed. Creating undirected copy for Leiden execution...")
         Gp_run = Gp.copy()
-        Gp_run.to_undirected(mode="collapse", combine_edges={"length": "mean", "weight": "mean"})
+        Gp_run.to_undirected(mode="collapse", combine_edges={"length": "min", "weight": "min"})
     else:
         Gp_run = Gp
 
-    # --- Choose weights ---
+    # 3. Define Edge Weights
+    # We invert 'length' to get 'strength': closer nodes = higher edge weight
     weights = None
     edge_attr_names = Gp_run.es.attribute_names()
 
     if "length" in edge_attr_names:
-        lengths = np.asarray(Gp_run.es["length"], dtype=float)
-        # Use "strength" as similarity weight (bigger for shorter edges)
-        Gp_run.es["strength"] = (1.0 / (lengths + 1e-6)).astype(float).tolist()
-        weights = "strength"  # pass attribute name
-        print("Using weights='strength' where strength=1/length")
+        lengths = np.array(Gp_run.es["length"], dtype=float)
+        strengths = 1.0 / (lengths + 1e-6)
+        weights = strengths.tolist()
+        print("Using custom weights: 1 / length")
     elif "weight" in edge_attr_names:
         weights = "weight"
-        print("Using weights='weight'")
+        print("Using edge weights attribute: 'weight'")
     else:
-        print("No 'length' or 'weight' edge attribute found: running unweighted Leiden.")
+        print("No length/weight attribute found. Using unweighted Leiden.")
 
-    # --- Gamma grid (hardcoded, plausible) ---
-    if args.objective == "CPM":
-        GAMMAS = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
-    else:
-        # keep the values smaller 
-        GAMMAS = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0]
+    # 4. Run Gamma Sweep (Hyperparameter Tuning)
+    # Different gammas yield different granularities.
+    GAMMAS = [0.001, 0.003, 0.005, 0.01, 0.02, 0.05] if args.objective == "CPM" else [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
-    print(f"\nRunning Leiden objective={args.objective} over {len(GAMMAS)} gamma values...")
-    results = run_leiden_tuning(
-        Gp_run,
-        gammas=GAMMAS,
-        objective=args.objective,
-        weights=weights,
-        n_iterations=10,
-        seed=args.seed,
-    )
-
-    best = pick_best_gamma(results, max_singletons=args.max_singletons, min_median_size=args.min_median_size)
-    best_gamma = best["gamma"]
-    part = best["partition"]
-    stats = best["stats"]
-
-    labels = list(map(int, part.membership))
+    results = run_leiden_tuning(Gp_run, gammas=GAMMAS, objective=args.objective, weights=weights)
     
-    # Merge micro-communities
-    labels = merge_tiny_communities(Gp_run, labels, s_min=10, passes=2)
-    # Assign to the original graph
-    Gp.vs["community"] = labels
+    # Pick best result by quality score
+    best = max(results, key=lambda r: r["stats"]["quality"])
+    best_part = best["partition"]
+    print(f"\nBest Gamma: {best['gamma']} (Quality: {best['stats']['quality']:.4f})")
 
+    # 5. Filter Top N Communities
+    # We only care about the largest urban clusters. Small fragments are discarded (-1).
+    print(f"\nFiltering top {args.top_n} communities by size...")
+    
+    comm_sizes = best_part.sizes()
+    
+    # Sort communities by size desc
+    # sorted_communities is list of (community_id, size)
+    sorted_communities = sorted(enumerate(comm_sizes), key=lambda x: x[1], reverse=True)
+    
+    # Identify top N community IDs
+    top_n_indices = [info[0] for info in sorted_communities[:args.top_n]]
+    top_n_set = set(top_n_indices)
+    
+    # Create new membership vector: keep ID if in top N, else -1
+    original_membership = best_part.membership
+    filtered_membership = [m if m in top_n_set else -1 for m in original_membership]
+    
+    # 6. Apply & Save
+    # Apply the filtered membership back to the original (possibly directed) graph object
+    Gp.vs["community"] = filtered_membership
+    
+    nodes_in_top = sum(1 for m in filtered_membership if m != -1)
+    
+    print(f"Filtering complete.")
+    print(f"Total nodes: {Gp.vcount()}")
+    print(f"Nodes assigned to top {args.top_n} communities: {nodes_in_top} ({(nodes_in_top/Gp.vcount())*100:.2f}%)")
+    print(f"Nodes set to -1 (discarded): {Gp.vcount() - nodes_in_top}")
 
-    print("\nSelected gamma:", best_gamma)
-    print(
-        f" n_comm={stats['n_communities']:,}"
-        f" | median={stats['size_median']:.1f}"
-        f" | singletons={100*stats['frac_singletons']:.1f}%"
-        f" | q={stats['quality']:.4f}"
-    )
-
-   
-    # Gp.vs["community"] = list(map(int, part.membership))
-
-    # --- Save (preserve package if dict) ---
-    if isinstance(data_pkg, dict):
-        out_pkg = data_pkg.copy()
-        out_pkg["graph"] = Gp
-        out_pkg["best_gamma"] = float(best_gamma)
-        out_pkg["best_stats"] = stats
-    else:
-        out_pkg = {"graph": Gp, "best_gamma": float(best_gamma), "best_stats": stats}
+    out_pkg = data_pkg.copy()
+    out_pkg["graph"] = Gp
 
     with open(args.output, "wb") as f:
         pickle.dump(out_pkg, f)
 
     print(f"Saved graph with community labels to: {os.path.abspath(args.output)}")
-
 
 if __name__ == "__main__":
     main()

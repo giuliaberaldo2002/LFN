@@ -1,3 +1,25 @@
+"""
+fix_connectivity.py
+-------------------
+Connects disconnected components in the graph by adding 'virtual' edges.
+Ensures the graph is fully connected so that sampling algorithms (like random walk)
+can traverse the entire structure.
+
+Logic:
+  - Identifies connected components.
+  - Selects a representative node (closest to geometric centroid) for each component.
+  - Builds a sparse k-NN graph between representatives using cKDTree (for efficiency).
+  - Computes the Minimum Spanning Tree (MST) of this k-NN graph.
+  - Adds the MST edges as new 'virtual' edges to the original graph.
+
+Inputs:
+  - --input: Path to disconnected graph pickle.
+  - --output: Path to save the connected graph.
+  - --weight_attr: Edge attribute to use for weights (default: 'length').
+
+Outputs:
+  - Saves the connected graph to the output path.
+"""
 
 import igraph as ig
 import numpy as np
@@ -194,6 +216,45 @@ def connect_graph_components(g: ig.Graph, weight_attr: str = "length") -> ig.Gra
         g.es[eid_start:][weight_attr] = weights_to_add
         g.es[eid_start:]["type"] = "virtual"
         
-        logger.info(f"Added {len(edges_to_add)} virtual edges to connect components.")
-        
     return g
+
+
+# -----------------------
+# Main
+# -----------------------
+
+def main():
+    import argparse
+    import pickle
+
+    parser = argparse.ArgumentParser(description="Fix connectivity in a graph by adding virtual edges.")
+    parser.add_argument("--input", required=True, help="Input graph pickle file")
+    parser.add_argument("--output", required=True, help="Output graph pickle file")
+    parser.add_argument("--weight_attr", default="length", help="Edge weight attribute (default: length)")
+    args = parser.parse_args()
+
+    # Load graph
+    with open(args.input, "rb") as f:
+        data = pickle.load(f)
+    if isinstance(data, dict) and "graph" in data:
+        g = data["graph"]
+    else:
+        g = data
+
+    # Connect components
+    g_connected = connect_graph_components(g, weight_attr=args.weight_attr)
+
+    # Save
+    if isinstance(data, dict):
+        out_data = data.copy()
+        out_data["graph"] = g_connected
+    else:
+        out_data = g_connected
+
+    with open(args.output, "wb") as f:
+        pickle.dump(out_data, f)
+
+    print(f"Connected graph saved to {args.output}")
+
+if __name__ == "__main__":
+    main()

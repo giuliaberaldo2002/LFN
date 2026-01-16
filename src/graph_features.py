@@ -1,10 +1,22 @@
 """
-Graph Features Computation
---------------------------
-Shared logic to compute node features for urbanity scoring.
-Extracts:
-- Tag-based features (highway frequencies, avg_maxspeed)
-- Topological features (degree, clustering coefficient, avg edge length)
+graph_features.py
+-----------------
+Shared module for computing node-level features used in urbanity scoring.
+This library provides functions to extract both tag-based and topological features
+from an igraph object.
+
+Features Computed:
+  1. Tag-based (from 'highway', 'maxspeed' edge attributes):
+     - Frequency distributions of highway types (residential, primary, motorway, service, other).
+     - Average maxspeed of incident edges.
+  2. Topological:
+     - Degree.
+     - Clustering coefficient (local transitivity).
+     - Average edge length of incident edges.
+
+Usage:
+  - Imported by `compute_features.py`.
+  - Functions modify the graph in-place by adding vertex attributes.
 """
 
 import math

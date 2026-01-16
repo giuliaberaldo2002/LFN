@@ -1,3 +1,26 @@
+"""
+check_connectivity.py
+---------------------
+Checks component/community sizes in the graph.
+Loads a graph (pickle), verifies the 'community' attribute exists, and analyzes
+the distribution of community sizes.
+
+Logic:
+  - Loads graph from input pickle.
+  - Counts nodes per 'community'.
+  - Reports total number of communities.
+  - Reports percentage of single-node and 2-node communities.
+  - Plots the sizes of the 10 smallest communities.
+
+Inputs:
+  - --input: Path to graph pickle (must have 'community' vertex attribute).
+  - --output_plot: Path to save the PNG plot (default: smallest_communities_sizes.png).
+
+Outputs:
+  - Prints statistics to stdout.
+  - Saves a bar chart of the smallest community sizes.
+"""
+
 import igraph as ig
 import pickle
 import argparse

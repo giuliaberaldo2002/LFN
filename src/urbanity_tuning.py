@@ -1,27 +1,32 @@
 """
+urbanity_tuning.py
 ------------------
-Manual urbanity tuning via constrained random search.
+Manual tuning of urbanity score weights via Constrained Random Search.
 
-Assumes the graph already has (node) attributes computed:
-  - degree
-  - clustering_coeff
-  - avg_edge_len
-  - freq_residential
-  - freq_motorway
-  - (optional) avg_maxspeed
+Purpose:
+  Learns a weight vector `w` such that the linear score `S = Z @ w` maximally separates 
+  "urban" areas from "rural" areas, based on heuristic anchors (e.g., high degree/clustering/residential 
+  vs large edge lengths/motorways).
 
-It then:
-  1) builds a feature matrix per node with stable transforms (log1p, winsorization)
-  2) z-scores (StandardScaler)
-  3) runs a random search over weight vectors with fixed sign constraints
-  4) picks the best weights according to an interpretable objective (separation of anchors)
-  5) saves the chosen weights + metadata to JSON
+Logic:
+  1. Loads graph with computed features (from compute_features.py).
+  2. Builds Feature Matrix X:
+     - Applies stable transforms (log1p for degree, winsorization for lengths).
+     - Standardizes features (Z-score).
+  3. Feature Selection: use stable set [log_degree, clustering, avg_edge, freq_res, freq_motorway].
+  4. Random Search:
+     - Samples random weight vectors `w` respecting sign constraints (e.g., degree > 0, edge_len < 0).
+     - Computes objective J(w): separation of top-q% vs bottom-q% quantiles on key features.
+  5. Selects best `w` and saves to JSON for use in `urban_pruning_final.py`.
 
-Usage:
-  python urbanity_tuning.py \
-      --input bremen_graph_with_features.pkl \
-      --output urbanity_weights.json \
-      --trials 800 --sample 80000 --seed 0
+Inputs:
+  - --input: Pickle of graph with vertex features.
+  - --output: Output JSON path for tuned weights.
+  - --trials: Number of random layouts to test (default 800).
+  - --sample: Number of nodes to sample for speed (default 80000).
+
+Outputs:
+  - JSON file containing feature names, learned weights, and transformation metadata.
 """
 
 import argparse
@@ -36,6 +41,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -49,6 +57,7 @@ logger = logging.getLogger("urbanity_tuning")
 # -----------------------------
 
 def _as_float_array(x) -> np.ndarray:
+    """Converts input sequence to float array, replacing NaNs/Infs with 0."""
     a = np.array(x, dtype=np.float64)
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a
@@ -75,7 +84,6 @@ class TuningConfig:
     include_maxspeed: bool = True
 
     # Ranges for random weights (magnitudes), signs are fixed by range sign.
-    # You can tweak these later if needed.
     w_ranges: Dict[str, Tuple[float, float]] = None
 
     def __post_init__(self):
@@ -114,7 +122,7 @@ def require_node_attrs(g, attrs: List[str]) -> None:
 
 
 # -----------------------------
-# Feature matrix builder
+# Feature Matrix Builder
 # -----------------------------
 
 def build_feature_matrix(
@@ -124,9 +132,7 @@ def build_feature_matrix(
 ) -> Tuple[np.ndarray, List[str], Dict]:
     """
     Build X (N x d) with stable transforms and minimal compositional issues.
-
-    We intentionally DO NOT include freq_other / freq_service to avoid
-    compositional redundancy dominating the signal.
+    We intentionally DO NOT include freq_other / freq_service to avoid compositional redundancy.
     """
     base_attrs = ["degree", "clustering_coeff", "avg_edge_len", "freq_residential", "freq_motorway"]
     if include_maxspeed:
@@ -140,7 +146,7 @@ def build_feature_matrix(
     res = _as_float_array(g.vs["freq_residential"])
     mw = _as_float_array(g.vs["freq_motorway"])
 
-    # transforms
+    # Transforms: Log degree, Cap edge lengths
     deg = np.log1p(deg)
     elen = _cap_percentile(elen, cap_p)
 
@@ -151,7 +157,7 @@ def build_feature_matrix(
         "log_degree": True,
         "cap_percentile": cap_p,
         "zscore": True,
-        "dropped_freqs": ["freq_other", "freq_service", "freq_primary"],  # document intent
+        "dropped_freqs": ["freq_other", "freq_service", "freq_primary"],
     }
 
     if include_maxspeed and "avg_maxspeed" in g.vs.attribute_names():
@@ -168,7 +174,7 @@ def build_feature_matrix(
 
 
 # -----------------------------
-# Tuning objective
+# Tuning Objective
 # -----------------------------
 
 def objective_separation(
@@ -179,7 +185,6 @@ def objective_separation(
 ) -> Tuple[float, Dict[str, float]]:
     """
     Evaluate how well scores separate anchor features between top and bottom q-quantiles.
-
     Since Zs is z-scored, deltas are in SD units and comparable.
     """
     lo = np.quantile(scores, q)
@@ -198,9 +203,9 @@ def objective_separation(
     d_mw  = delta("freq_motorway")
     d_ms  = delta("avg_maxspeed") if "avg_maxspeed" in names else 0.0
 
-    # We want:
-    #  top should have higher deg/res/clu (positive deltas)
-    #  top should have lower edge_len/motorway/maxspeed (negative deltas)
+    # Objective: Maximize separation in correct directions
+    # Positive: degree, residential, clustering
+    # Negative: edge length, motorway, maxspeed
     J = (
         1.00 * d_deg +
         0.80 * d_res +
@@ -210,7 +215,7 @@ def objective_separation(
         - 0.50 * d_ms
     )
 
-    # Hard penalties if direction is “wrong”
+    # Hard penalties if direction is fundamentally "wrong"
     if d_deg < 0: J -= 5.0
     if d_res < 0: J -= 3.0
     if d_len > 0: J -= 3.0
@@ -234,12 +239,12 @@ def tune_weights(
     cfg: TuningConfig,
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Random search with sign constraints encoded by the ranges in cfg.w_ranges.
+    Performs constrained random search over weight vectors.
     """
     rng = np.random.default_rng(cfg.seed)
     N, d = Z.shape
 
-    # Sample for speed
+    # Sample for speed if graph is large
     if N > cfg.sample_n:
         idx = rng.choice(N, size=cfg.sample_n, replace=False)
         Zs = Z[idx]
@@ -250,8 +255,8 @@ def tune_weights(
     # Precompute index mapping
     name_to_j = {n: j for j, n in enumerate(names)}
 
-    # Build per-dimension ranges aligned to Z columns
-    ranges = [(-0.01, 0.01)] * d  # default tiny noise for unused dims (shouldn’t happen)
+    # Build per-dimension ranges
+    ranges = [(-0.01, 0.01)] * d
     for feat, (a, b) in cfg.w_ranges.items():
         if feat in name_to_j:
             ranges[name_to_j[feat]] = (a, b)
@@ -264,10 +269,9 @@ def tune_weights(
         w = np.zeros(d, dtype=np.float32)
         for j in range(d):
             a, b = ranges[j]
-            # If a==b, deterministic; otherwise random
             w[j] = rng.uniform(a, b) if a != b else np.float32(a)
 
-        # Normalize scale for stability (doesn't change ranking in z-scored space)
+        # Normalize scale for stability
         w = w / (np.linalg.norm(w) + 1e-8)
 
         s = (Zs @ w).astype(np.float32, copy=False)
@@ -292,7 +296,7 @@ def tune_weights(
 
 
 # -----------------------------
-# Main (CLI)
+# Main Execution
 # -----------------------------
 
 def main():
@@ -321,7 +325,7 @@ def main():
 
     logger.info(f"Loaded graph: nodes={g.vcount():,} edges={g.ecount():,}")
 
-    # Build features
+    # 1. Build Features
     X, names, transforms = build_feature_matrix(
         g,
         cap_p=cfg.cap_p,
@@ -329,11 +333,11 @@ def main():
     )
     logger.info(f"Feature set ({len(names)}): {names}")
 
-    # Standardize
+    # 2. Standardize Features
     scaler = StandardScaler()
     Z = scaler.fit_transform(X).astype(np.float32, copy=False)
 
-    # Tune weights
+    # 3. Tune Weights
     best_w, info = tune_weights(Z, names, cfg)
 
     logger.info(f"Best objective: {info['best_objective']:.4f}")
@@ -345,7 +349,7 @@ def main():
     for n, w in zip(names, best_w):
         logger.info(f"  {n:<18s}: {float(w):+.4f}")
 
-    # Save
+    # 4. Save Weights
     out = {
         "feature_names": names,
         "weights": [float(x) for x in best_w],

@@ -1,5 +1,3 @@
-
-#!/usr/bin/env python3
 """
 compare_algorithms.py
 --------------------
@@ -186,10 +184,6 @@ def evaluate_on_pruned(
 ) -> Tuple[Dict[str, Any], int, float]:
     """
     Evaluate a sampled set (OSMIDs) on the pruned graph with midterm metrics.
-    Returns:
-      - midterm_metrics (dict)
-      - k_eff (# of valid unique hits in pruned)
-      - efficiency (k_eff / k_requested)
     """
     k_req = len(sampled_osmids)
     valid_idx = map_osmids_to_pruned_indices(pruned_osmid_to_idx, sampled_osmids)
@@ -218,26 +212,94 @@ def evaluate_on_pruned(
 
 
 # -------------------------
-# Plotting
+# Plotting & Output Generation
 # -------------------------
 
 def plot_metric_with_errorbars(df_agg: pd.DataFrame, metric: str, ylabel: str, title: str, out_png: str):
+    """Generates and saves a single plot."""
     plt.figure(figsize=(10, 6))
+    
+    # Use distinct colors/markers if possible, default works well for few algos
     for algo in df_agg["algo"].unique():
         sub = df_agg[df_agg["algo"] == algo].sort_values("k")
+        # Ensure k is numeric for proper x-axis scaling
+        ks = sub["k"].astype(int)
+        means = sub[f"{metric}_mean"]
+        stds = sub[f"{metric}_std"]
+        
         plt.errorbar(
-            sub["k"], sub[f"{metric}_mean"],
-            yerr=sub[f"{metric}_std"],
-            marker="o", capsize=3, linewidth=2, label=algo
+            ks, means,
+            yerr=stds,
+            marker="o", capsize=3, linewidth=2, label=algo, alpha=0.8
         )
+    
     plt.xlabel("k (Number of samples)")
     plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_png)
+    plt.savefig(out_png, dpi=150)
     plt.close()
+
+def generate_outputs(rows: List[Dict], output_dir: str):
+    """
+    Process the rows collected so far:
+    1. Save raw results CSV
+    2. Aggregate (mean/std)
+    3. Save aggregated CSV
+    4. Generate all plots
+    """
+    if not rows:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 1. Save Raw
+    df = pd.DataFrame(rows)
+    raw_csv = os.path.join(output_dir, "results_raw.csv")
+    df.to_csv(raw_csv, index=False)
+
+    # 2. Aggregate
+    metrics = [
+        "efficiency", "cov", "balance_cv", "balance_entropy",
+        "global_R_max", "global_mean", "global_median", "global_p90",
+        "div_min_sep", "div_mean", "div_median", "div_p10", "div_p90",
+    ]
+    
+    # Ensure aggregation works even with 1 repeat (std will be NaN/0)
+    grp = df.groupby(["algo", "k"], as_index=False)
+    agg_mean = grp[metrics].mean().rename(columns={m: f"{m}_mean" for m in metrics})
+    agg_std  = grp[metrics].std(ddof=0).rename(columns={m: f"{m}_std" for m in metrics})
+    # Fill NaN std with 0 if only one run
+    agg_std = agg_std.fillna(0)
+
+    df_agg = pd.merge(agg_mean, agg_std, on=["algo", "k"], how="inner")
+    agg_csv = os.path.join(output_dir, "results_agg.csv")
+    df_agg.to_csv(agg_csv, index=False)
+
+    # 3. Plots
+    plot_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    plot_metric_with_errorbars(df_agg, "efficiency", "Urban Efficiency (0-1)", "Urban Efficiency vs k",
+                               os.path.join(plot_dir, "efficiency.png"))
+    plot_metric_with_errorbars(df_agg, "cov", "Community Coverage (0-1)", "Community Coverage vs k",
+                               os.path.join(plot_dir, "coverage.png"))
+    plot_metric_with_errorbars(df_agg, "global_R_max", "R_max (graph distance)", "Global Coverage (R_max) vs k (Lower is Better)",
+                               os.path.join(plot_dir, "global_R_max.png"))
+    plot_metric_with_errorbars(df_agg, "global_p90", "p90 d(x,S) (graph distance)", "Global Coverage (p90) vs k (Lower is Better)",
+                               os.path.join(plot_dir, "global_p90.png"))
+    plot_metric_with_errorbars(df_agg, "div_min_sep", "Min separation (graph distance)", "Diversity (Min Sep) vs k (Higher is Better)",
+                               os.path.join(plot_dir, "div_min_sep.png"))
+    plot_metric_with_errorbars(df_agg, "div_p10", "p10 pairwise distance", "Diversity (p10) vs k (Higher is Better)",
+                               os.path.join(plot_dir, "div_p10.png"))
+    plot_metric_with_errorbars(df_agg, "balance_cv", "CV over community counts", "Balance (CV) vs k (Lower is Better)",
+                               os.path.join(plot_dir, "balance_cv.png"))
+    plot_metric_with_errorbars(df_agg, "balance_entropy", "Normalized entropy (0-1)", "Balance (Entropy) vs k (Higher is Better)",
+                               os.path.join(plot_dir, "balance_entropy.png"))
+    
+    logger.info(f" -> Generated cumulative plots/stats in: {output_dir}")
 
 
 # -------------------------
@@ -248,7 +310,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", required=True, help="Full graph pickle")
     ap.add_argument("--pruned", required=True, help="Pruned graph pickle (must include 'community')")
-    ap.add_argument("--outdir", default="comparison_results", help="Output directory")
+    ap.add_argument("--outdir", default="comparison_results", help="Base output directory")
     ap.add_argument("--ks", nargs="+", type=int, default=[10, 20, 50, 100, 200, 500])
     ap.add_argument("--repeats", type=int, default=5, help="How many runs with different seeds")
     ap.add_argument("--seed", type=int, default=0, help="Base seed")
@@ -260,22 +322,46 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    plot_dir = os.path.join(args.outdir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
 
     full_pkg = load_graph_pkg(args.full)
     pruned_pkg = load_graph_pkg(args.pruned)
     full_g = full_pkg["graph"]
     pruned_g = pruned_pkg["graph"]
 
-    # FIX: Ensure graph is connected for metric calculation (virtual edges)
+    # Make undirected for symmetric distances
+    pruned_g.to_undirected()
+
+    # Ensure graph is connected for metric calculation
     pruned_g = connect_graph_components(pruned_g, weight_attr=args.weight_attr)
 
     if "community" not in pruned_g.vs.attribute_names():
         raise ValueError("Pruned graph must have vertex attribute 'community' (run Leiden first).")
 
-    pruned_osmid_to_idx = build_osmid_to_index(pruned_g)
+    # Process community labels
     labels = np.asarray(pruned_g.vs["community"], dtype=int)
+    unique_comms, counts = np.unique(labels, return_counts=True)
+
+    # Exclude -1 if present
+    if -1 in unique_comms:
+        mask = unique_comms != -1
+        unique_comms = unique_comms[mask]
+        counts = counts[mask]
+    n_unique_before = len(unique_comms)
+    logger.info(f"Input graph has {n_unique_before} unique communities (excluding -1).")
+    
+    # Filter to top 500 communities by size
+    if n_unique_before == 500:
+        logger.info("Top 500 communities were already set in the input graph.")
+    else:
+        logger.info(f"Filtering from {n_unique_before} to top 500 communities by size.")
+    
+    sorted_idx = np.argsort(counts)[::-1]
+    top_300_comms = set(unique_comms[sorted_idx][:500])
+    new_labels = np.where(np.isin(labels, list(top_300_comms)), labels, -1)
+    pruned_g.vs["community"] = new_labels
+    labels = new_labels
+
+    pruned_osmid_to_idx = build_osmid_to_index(pruned_g)
 
     logger.info(f"Full graph:   n={full_g.vcount():,}, m={full_g.ecount():,}")
     logger.info(f"Pruned graph: n={pruned_g.vcount():,}, m={pruned_g.ecount():,}")
@@ -287,7 +373,7 @@ def main():
     rep_list = [reps[cid] for cid in city_ids]
     
     if "x" in pruned_g.vs.attribute_names() and "y" in pruned_g.vs.attribute_names():
-        # Use Euclidean distance as fast approximation
+        # Use Euclidean distance as fast approximation for sorting cities
         rep_coords = np.array([[pruned_g.vs[rep]["x"], pruned_g.vs[rep]["y"]] for rep in rep_list])
         d_mat = cdist(rep_coords, rep_coords, metric='euclidean')
         logger.info(f"Using Euclidean distance approximation for {len(city_ids)} communities.")
@@ -301,11 +387,7 @@ def main():
         logger.info(f"Using graph shortest paths for {len(city_ids)} communities.")
     
     deg = np.asarray(pruned_g.degree(), dtype=int)
-    logger.info(f"Precomputed distance matrix for {len(city_ids)} communities.")
-
-    # Precompute CSR once (major speedup) -> Replaced by igraph
-    # indptr, indices, data = build_csr_adjacency(pruned_g, weight_attr=args.weight_attr)
-
+    
     # Optional eval subset
     eval_subset = None
     if args.eval_subset and 0 < args.eval_subset < pruned_g.vcount():
@@ -314,14 +396,21 @@ def main():
         logger.info(f"Using eval_subset of size {len(eval_subset):,} for global coverage approx.")
 
     smart_list = ["round_robin", "fft", "hybrid"] if args.smart == "all" else [args.smart]
-
     rows = []
+    
+    # Track used seeds for folder naming
+    used_seeds = []
 
+    # -----------------------
+    # MAIN LOOP OVER REPEATS
+    # -----------------------
     for r in range(args.repeats):
         run_seed = args.seed + r
+        used_seeds.append(run_seed)
+        
         logger.info(f"=== Repeat {r+1}/{args.repeats} seed={run_seed} ===")
         
-        # Precompute city order for 'hybrid' if needed
+        # Precomputing city order for 'hybrid' for THIS seed
         cached_order = None
         if "hybrid" in smart_list:
             logger.info("  Precomputing community FFT order (optimized)...")
@@ -329,7 +418,6 @@ def main():
 
         for k in args.ks:
             # 1) Dummy 1: FULL random
-            logger.info(f"  k={k}: Running Dummy 1 (Full Random)")  ### NEW LOG
             s_full = algo_full_random(full_g, k, run_seed)
             mid_full, k_eff_full, eff_full = evaluate_on_pruned(
                 pruned_g, pruned_osmid_to_idx, s_full, labels,
@@ -348,7 +436,6 @@ def main():
             })
 
             # 2) Dummy 2: PRUNED random
-            logger.info(f"  k={k}: Running Dummy 2 (Pruned Random)") ### NEW LOG
             s_pr = algo_pruned_random(pruned_g, k, run_seed)
             mid_pr, k_eff_pr, eff_pr = evaluate_on_pruned(
                 pruned_g, pruned_osmid_to_idx, s_pr, labels,
@@ -366,17 +453,13 @@ def main():
                 **flat_pr,
             })
 
-            # 3) Pipeline smart(s) on PRUNED
+            # 3) Pipeline smart(s)
             for sm in smart_list:
-                logger.info(f"    ... running Pipeline Smart ({sm}) k={k}") ### NEW LOG
-                
-                # Se 'sm' è 'hybrid', qui potrebbe impiegarci vari minuti per l'inizializzazione!
                 s_sm = algo_pipeline_smart(
                     pruned_g, k, run_seed, method=sm,
                     weight_attr=args.weight_attr,
                     cached_city_order=cached_order
                 )
-                
                 mid_sm, k_eff_sm, eff_sm = evaluate_on_pruned(
                     pruned_g, pruned_osmid_to_idx, s_sm, labels,
                     weight_attr=args.weight_attr,
@@ -393,49 +476,22 @@ def main():
                     **flat_sm,
                 })
 
-            logger.info(
-                f"k={k:4d} DONE | eff(full)={eff_full:.2f} | cov(pr)={flat_pr['cov']:.3f}"
-            )
+        # ----------------------------------------------------
+        # INCREMENTAL PLOTTING / SAVING after each seed
+        # ----------------------------------------------------
+        
+        seed_str = "_".join(map(str, used_seeds))
+        if len(seed_str) > 50: 
+            seed_folder_name = f"seeds_{used_seeds[0]}_to_{used_seeds[-1]}"
+        else:
+            seed_folder_name = f"seed_{seed_str}"
 
-    df = pd.DataFrame(rows)
-    raw_csv = os.path.join(args.outdir, "results_raw.csv")
-    df.to_csv(raw_csv, index=False)
-    logger.info(f"Saved raw results: {raw_csv}")
+        current_output_dir = os.path.join(args.outdir, seed_folder_name)
+        
+        logger.info(f"End of seed {run_seed}. Saving/Plotting cumulative results to: {current_output_dir}")
+        generate_outputs(rows, current_output_dir)
 
-    metrics = [
-        "efficiency", "cov", "balance_cv", "balance_entropy",
-        "global_R_max", "global_mean", "global_median", "global_p90",
-        "div_min_sep", "div_mean", "div_median", "div_p10", "div_p90",
-    ]
-    grp = df.groupby(["algo", "k"], as_index=False)
-    agg_mean = grp[metrics].mean().rename(columns={m: f"{m}_mean" for m in metrics})
-    agg_std  = grp[metrics].std(ddof=0).rename(columns={m: f"{m}_std" for m in metrics})
-
-    df_agg = pd.merge(agg_mean, agg_std, on=["algo", "k"], how="inner")
-    agg_csv = os.path.join(args.outdir, "results_agg.csv")
-    df_agg.to_csv(agg_csv, index=False)
-    logger.info(f"Saved aggregated results: {agg_csv}")
-
-    # Plots (midterm metrics)
-    plot_metric_with_errorbars(df_agg, "efficiency", "Urban Efficiency (0-1)", "Urban Efficiency vs k",
-                              os.path.join(plot_dir, "efficiency.png"))
-    plot_metric_with_errorbars(df_agg, "cov", "Community Coverage (0-1)", "Community Coverage vs k",
-                              os.path.join(plot_dir, "coverage.png"))
-    plot_metric_with_errorbars(df_agg, "global_R_max", "R_max (graph distance)", "Global Coverage (R_max) vs k (Lower is Better)",
-                              os.path.join(plot_dir, "global_R_max.png"))
-    plot_metric_with_errorbars(df_agg, "global_p90", "p90 d(x,S) (graph distance)", "Global Coverage (p90) vs k (Lower is Better)",
-                              os.path.join(plot_dir, "global_p90.png"))
-    plot_metric_with_errorbars(df_agg, "div_min_sep", "Min separation (graph distance)", "Diversity (Min Sep) vs k (Higher is Better)",
-                              os.path.join(plot_dir, "div_min_sep.png"))
-    plot_metric_with_errorbars(df_agg, "div_p10", "p10 pairwise distance", "Diversity (p10) vs k (Higher is Better)",
-                              os.path.join(plot_dir, "div_p10.png"))
-    plot_metric_with_errorbars(df_agg, "balance_cv", "CV over community counts", "Balance (CV) vs k (Lower is Better)",
-                              os.path.join(plot_dir, "balance_cv.png"))
-    plot_metric_with_errorbars(df_agg, "balance_entropy", "Normalized entropy (0-1)", "Balance (Entropy) vs k (Higher is Better)",
-                              os.path.join(plot_dir, "balance_entropy.png"))
-
-    logger.info(f"Saved plots in: {plot_dir}")
-
+    logger.info("All repeats completed.")
 
 if __name__ == "__main__":
     main()

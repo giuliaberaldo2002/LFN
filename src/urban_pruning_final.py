@@ -1,11 +1,25 @@
 """
-Urbanity Pruning (Manual Tuning + GMM)
---------------------------------------
-Computes features for an OSM road network, applies a manually tuned urbanity score
-(learned by constrained random search in urbanity_tuning.py), and prunes rural nodes
-by fitting a 2-component GMM on the 1D score distribution.
+urban_pruning_final.py
+----------------------
+Step 3 in the pipeline (after feature computation).
+Computes urbanity scores for all nodes and prunes the graph to retain only "urban" areas.
 
-Author: Giulia 
+Logic:
+  1. Loads the graph with features (from compute_features.py).
+  2. Loads the tuned feature weights (from urbanity_tuning.py / urbanity_weights.json).
+  3. Constructs the feature matrix X for valid features (log_degree, clustering, freq_residential, etc.).
+  4. Standardizes X and computes the linear score: score = Z @ w.
+  5. Fits a 2-component Gaussian Mixture Model (GMM) to the score distribution to find the "urban" cluster.
+  6. Filters nodes where P(urban | score) > threshold (default 0.5).
+  7. Saves the pruned graph.
+
+Inputs:
+  - --input: Pickle of graph with vertex features.
+  - --weights: JSON containing feature names and weights.
+  - --prob_threshold: Minimum probability to classify a node as urban (default 0.5).
+
+Outputs:
+  - Saves the pruned graph to --output.
 """
 
 import os
@@ -32,7 +46,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------
-# Constants
+# Constants / Defaults
 # -----------------------
 DEFAULT_INPUT_PKL = "bremen_graph_with_features.pkl"
 DEFAULT_OUTPUT_PRUNED = "bremen_pruned_graph.pkl"
@@ -42,9 +56,11 @@ MAIN_HIGHWAY_TYPES = {"residential", "primary", "motorway", "service"}
 
 
 # -----------------------
-# I/O
+# I/O Helper Functions
 # -----------------------
+
 def load_graph_data(filepath: str) -> Tuple[ig.Graph, Dict[int, int]]:
+    """Loads feature-enriched graph from pickle."""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"{filepath} not found. Run graph_init_optimized.py first.")
     logger.info(f"Loading graph from {filepath}...")
@@ -53,6 +69,7 @@ def load_graph_data(filepath: str) -> Tuple[ig.Graph, Dict[int, int]]:
     return data["graph"], data.get("osmid_map", {})
 
 def load_tuned_weights(json_path: str) -> Tuple[list[str], np.ndarray, dict]:
+    """Loads feature weights metdata from JSON."""
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"{json_path} not found. Run urbanity_tuning.py first.")
     with open(json_path, "r", encoding="utf-8") as f:
@@ -63,14 +80,12 @@ def load_tuned_weights(json_path: str) -> Tuple[list[str], np.ndarray, dict]:
     return names, w, meta
 
 
-# Features are now computed in compute_features.py using graph_features.py
-# and loaded directly from bremen_graph_with_features.pkl
-
-
 # -----------------------
-# Manual-score feature matrix builder (MUST match tuning)
+# Feature Matrix Construction
 # -----------------------
+
 def _cap_percentile(x: np.ndarray, p: float) -> np.ndarray:
+    """Outlier capping at percentile p."""
     x = x.copy()
     mask = np.isfinite(x)
     if not np.any(mask):
@@ -81,14 +96,8 @@ def _cap_percentile(x: np.ndarray, p: float) -> np.ndarray:
 
 def build_X_from_names(g: ig.Graph, feature_names: list[str], cap_p: float) -> np.ndarray:
     """
-    Builds X columns in the same order as the tuned feature_names.
-    Supported names (from tuner):
-      - log_degree
-      - clustering_coeff
-      - freq_residential
-      - avg_edge_len
-      - freq_motorway
-      - avg_maxspeed (optional)
+    Builds the feature matrix X columns in the order defined by the tuned weights.
+    Applies necessary transforms (log, capping) to match the tuning phase.
     """
     cols = []
     for name in feature_names:
@@ -125,20 +134,33 @@ def build_X_from_names(g: ig.Graph, feature_names: list[str], cap_p: float) -> n
     return X
 
 
+# -----------------------
+# GMM Scoring & Filtering
+# -----------------------
+
 def gmm_keep_indices(scores: np.ndarray, seed: int = 0, prob_threshold: float = 0.5) -> np.ndarray:
+    """
+    Fits a 2-component GMM on 1D scores and returns indices of nodes
+    that belong to the 'Urban' cluster (classification by probability).
+    """
     S = scores.reshape(-1, 1).astype(np.float32, copy=False)
     gmm = GaussianMixture(n_components=2, random_state=seed).fit(S)
+    
+    # Identify which component mean is higher (assumed to be Urban)
     means = gmm.means_.ravel()
     urban_label = int(np.argmax(means))
+    
     proba_urban = gmm.predict_proba(S)[:, urban_label]
     keep = np.where(proba_urban >= prob_threshold)[0]
+    
     logger.info(f"GMM means={means}, urban_label={urban_label}, keep={len(keep):,}/{len(scores):,}")
     return keep
 
 
 # -----------------------
-# Main
+# Main Execution
 # -----------------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default=DEFAULT_INPUT_PKL, help="Input graph (with features) pickle")
@@ -152,25 +174,23 @@ def main():
     g, osmid_map = load_graph_data(args.input)
     logger.info(f"Nodes: {g.vcount():,}, Edges: {g.ecount():,}")
 
-    # 1) compute features (already computed in compute_features.py)
-    # add_tag_based_features(g)
-    # compute_topology_features(g)
-
-    # 2) load tuned weights
+    # 1. Load Tuned Weights
     tuned_names, w, meta = load_tuned_weights(args.weights)
     cap_p = float(meta.get("cap_percentile", 99.5))
     logger.info(f"Loaded tuned weights from {args.weights}")
     logger.info(f"Feature order: {tuned_names}")
 
-    # 3) build X and standardize
+    # 2. Build Feature Matrix X and Standardize
+    # Matches the exact preprocessing used during tuning
     X = build_X_from_names(g, tuned_names, cap_p=cap_p)
     Z = StandardScaler().fit_transform(X).astype(np.float32, copy=False)
 
-    # 4) score
+    # 3. Compute Linear Score
     scores = (Z @ w).astype(np.float32, copy=False)
-    g.vs["urbanity_score"] = scores.tolist()
+    g.vs["urbanity_score"] = scores.tolist() # Save score to graph for reference
 
-    # 5) prune using GMM split on 1D scores
+    # 4. Prune using GMM
+    # Finds the high-score GMM component and keeps nodes belonging to it
     keep_indices = gmm_keep_indices(scores, seed=0, prob_threshold=args.prob_threshold)
 
     g_pruned = g.subgraph(keep_indices.tolist())
