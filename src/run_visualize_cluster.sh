@@ -24,7 +24,7 @@ echo "=== STARTING VISUALIZATION OF SMALLEST COMMUNITIES ==="
 
 # Define filenames
 INPUT_COMMS="nord_est_with_communities_no_conn.pkl"
-OUTPUT_IMG="nord_est_top_200_clusters_no_conn.png"
+OUTPUT_IMG="nord_est_top_500_clusters_no_conn.png"
 
 echo "Using input: $INPUT_COMMS"
 
