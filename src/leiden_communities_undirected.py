@@ -33,6 +33,7 @@ import pickle
 import numpy as np
 import sys
 import os
+from collections import Counter, defaultdict
 
 
 DEFAULT_INPUT = "nord_est_pruned_graph.pkl"
@@ -110,6 +111,63 @@ def pick_best_gamma(results, max_singletons=0.30, min_median_size=10.0):
     return max(candidates, key=lambda r: r["stats"]["quality"])
 
 
+def merge_tiny_communities(g: ig.Graph, labels: list[int], s_min: int = 10, passes: int = 2) -> list[int]:
+    """
+    Merge communities with size < s_min into the most frequent neighboring community.
+    Works on the current graph topology (undirected recommended).
+    """
+    labels = list(map(int, labels))
+    n = g.vcount()
+
+    for _ in range(passes):
+        # build size table
+        sizes = Counter(labels)
+
+        # group nodes by community
+        comm_nodes = defaultdict(list)
+        for v, c in enumerate(labels):
+            comm_nodes[c].append(v)
+
+        # identify tiny communities
+        tiny = [c for c, sz in sizes.items() if sz < s_min]
+        if not tiny:
+            break
+
+        changed = 0
+
+        for c in tiny:
+            nodes = comm_nodes[c]
+            if not nodes:
+                continue
+
+            neighbor_comms = Counter()
+
+            # look at boundary neighbors
+            for v in nodes:
+                for u in g.neighbors(v):
+                    cu = labels[u]
+                    if cu != c:
+                        neighbor_comms[cu] += 1
+
+            if not neighbor_comms:
+                # isolated tiny component: skip (or you could assign to closest by coord if you want)
+                continue
+
+            # pick most frequent neighboring community
+            target = neighbor_comms.most_common(1)[0][0]
+
+            # reassign all nodes in c
+            for v in nodes:
+                labels[v] = target
+            changed += 1
+
+        if changed == 0:
+            break
+
+    return labels
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Leiden (CPM or modularity) on pruned graph + tune gamma.")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input pruned graph pickle")
@@ -164,7 +222,7 @@ def main():
     if args.objective == "CPM":
         GAMMAS = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
     else:
-        # modularity doesn't really use gamma in the same way; keep a small sweep if your igraph supports it
+        # keep the values smaller 
         GAMMAS = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0]
 
     print(f"\nRunning Leiden objective={args.objective} over {len(GAMMAS)} gamma values...")
@@ -182,6 +240,14 @@ def main():
     part = best["partition"]
     stats = best["stats"]
 
+    labels = list(map(int, part.membership))
+    
+    # Merge micro-communities
+    labels = merge_tiny_communities(Gp_run, labels, s_min=10, passes=2)
+    # Assign to the original graph
+    Gp.vs["community"] = labels
+
+
     print("\nSelected gamma:", best_gamma)
     print(
         f" n_comm={stats['n_communities']:,}"
@@ -190,8 +256,8 @@ def main():
         f" | q={stats['quality']:.4f}"
     )
 
-    # --- Assign membership back to ORIGINAL graph (vertex indices preserved) ---
-    Gp.vs["community"] = list(map(int, part.membership))
+   
+    # Gp.vs["community"] = list(map(int, part.membership))
 
     # --- Save (preserve package if dict) ---
     if isinstance(data_pkg, dict):
